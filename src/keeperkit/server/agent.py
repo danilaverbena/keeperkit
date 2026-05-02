@@ -9,20 +9,19 @@ We deliberately use ``langgraph.prebuilt.create_react_agent`` because:
 3. It's async-friendly, so the FastAPI handler can await ``ainvoke`` without
    blocking the event loop.
 
-If the hosting environment doesn't have an OpenAI API key (or another
-LangChain-compatible LLM key), we still want the demo dashboard to be
-useful, so we expose a deterministic fallback: an LLM-less heuristic agent
-that recognizes a few common prompts (balance check, list workflows, transfer
-on Sepolia, etc.) and dispatches the appropriate tool directly. This keeps
-the demo server functional even without paid LLM credentials.
+The model is chosen by :mod:`keeperkit.server.llm` based on which provider
+key is present (OpenAI, Anthropic, Google Gemini, Groq, DeepSeek,
+OpenRouter, Mistral, Together, Ollama). If no provider can be built we fall
+back to a deterministic heuristic agent so the dashboard still works
+offline.
 """
 
 from __future__ import annotations
 
-import os
 import re
 from typing import Any
 
+from keeperkit.server.llm import build_llm, detect_provider
 from keeperkit.tools._common import default_dispatch, find_spec
 
 ETH_ADDR = re.compile(r"0x[a-fA-F0-9]{40}")
@@ -126,7 +125,10 @@ def _heuristic_agent(client: Any, prompt: str) -> dict[str, Any]:
             "  • 'What web3 actions does KeeperHub support?'\n"
             "  • 'Transfer 0.01 ETH on Sepolia to 0xdef…'\n"
             "  • 'Generate a workflow that sends a daily balance report'\n"
-            "Or set OPENAI_API_KEY to enable the full LangChain ReAct agent."
+            "Or set one of OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY "
+            "/ GROQ_API_KEY / DEEPSEEK_API_KEY / OPENROUTER_API_KEY / "
+            "MISTRAL_API_KEY / TOGETHER_API_KEY (or OLLAMA_BASE_URL) to enable "
+            "the full LangChain ReAct agent."
         )
 
     return {"engine": "heuristic", "final_answer": final_answer, "trace": plan}
@@ -135,18 +137,19 @@ def _heuristic_agent(client: Any, prompt: str) -> dict[str, Any]:
 async def _langchain_agent(client: Any, prompt: str) -> dict[str, Any]:
     """Full ReAct agent using LangChain + LangGraph."""
     try:
-        from langchain_openai import ChatOpenAI
         from langgraph.prebuilt import create_react_agent
     except ImportError as exc:  # pragma: no cover - import guard
         raise RuntimeError(
-            "Install `langchain` and `langchain-openai` (already in the "
-            "[server] extras) to use the LLM-driven agent."
+            "Install `langgraph` (already in the [server] extras) to use "
+            "the LLM-driven agent."
         ) from exc
 
     from keeperkit.tools.langchain import build_langchain_tools
 
-    model_name = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0)
+    resolved = build_llm()
+    if resolved is None:
+        raise RuntimeError("No LLM provider configured.")
+    llm, label = resolved
     tools = build_langchain_tools(client)
 
     system_prompt = (
@@ -184,18 +187,18 @@ async def _langchain_agent(client: Any, prompt: str) -> dict[str, Any]:
         if msg_type == "ai" and content:
             final_answer = content if isinstance(content, str) else str(content)
 
-    return {"engine": f"langchain:{model_name}",
+    return {"engine": f"langchain:{label}",
             "final_answer": final_answer, "trace": trace}
 
 
 async def run_agent(client: Any, prompt: str) -> dict[str, Any]:
     """Entry point used by the FastAPI handler.
 
-    Picks the LangChain ReAct agent when an OpenAI key is available, otherwise
-    falls back to the LLM-less heuristic so the demo is always interactive.
+    Picks the LangChain ReAct agent when any LLM provider is configured,
+    otherwise falls back to the LLM-less heuristic so the demo is always
+    interactive.
     """
-    has_openai = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    if not has_openai:
+    if detect_provider() is None:
         return _heuristic_agent(client, prompt)
     try:
         return await _langchain_agent(client, prompt)

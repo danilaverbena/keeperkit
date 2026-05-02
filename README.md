@@ -198,8 +198,10 @@ python -m keeperkit.server                    # serves at http://0.0.0.0:8000
 What you get:
 
 * **Dashboard** at `/` — live status badge, prompt box, direct tool dispatch.
-* **`POST /api/agent/run`** — LangChain ReAct agent (or LLM-less heuristic if
-  you have no `OPENAI_API_KEY`).
+* **`POST /api/agent/run`** — LangChain ReAct agent. Auto-picks OpenAI,
+  Anthropic, Google Gemini, Groq, DeepSeek, OpenRouter, Mistral, Together, or
+  Ollama based on which API key is set; falls back to an LLM-less heuristic
+  if none are configured.
 * **`POST /api/tools/{name}`** — one-shot dispatch to any KeeperKit tool.
 * **`GET /api/elizaos/plugin.json`** — live ElizaOS plugin descriptor.
 * **`POST /keeperkit/dispatch`** — bridge endpoint for the ElizaOS plugin.
@@ -209,13 +211,67 @@ What you get:
 
 ## Configuration
 
+### Getting a KeeperHub API key
+
+1. Sign up / log in at <https://keeperhub.com>.
+2. Open or create an **Organization** (top-right menu — *Personal* keys cannot
+   execute workflows).
+3. **Settings → API Keys → Organisation tab → New API Key.**
+4. Copy the `kh_…` token into `KEEPERHUB_API_KEY`.
+
+Without a key, KeeperKit runs against the in-memory `MockKeeperHubClient` so
+you can demo end-to-end with no external dependencies.
+
+### Picking an LLM
+
+KeeperKit's demo agent is built on LangChain — **any** chat model works.
+The server auto-detects whichever provider key is in your environment, in
+this priority order:
+
+`anthropic → google → groq → deepseek → openrouter → mistral → together → ollama → openai`
+
+| Provider | Env var | Free tier? | Where to get a key |
+|---|---|---|---|
+| **OpenAI** | `OPENAI_API_KEY` | paid | <https://platform.openai.com/api-keys> |
+| **Anthropic Claude** | `ANTHROPIC_API_KEY` | trial credits | <https://console.anthropic.com/settings/keys> |
+| **Google Gemini** | `GOOGLE_API_KEY` | **yes** | <https://aistudio.google.com/app/apikey> |
+| **Groq** | `GROQ_API_KEY` | **yes (fast)** | <https://console.groq.com/keys> |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | cheap paid | <https://platform.deepseek.com/api_keys> |
+| **OpenRouter** | `OPENROUTER_API_KEY` | pay-as-you-go, 200+ models | <https://openrouter.ai/keys> |
+| **Mistral** | `MISTRAL_API_KEY` | trial credits | <https://console.mistral.ai/api-keys> |
+| **Together AI** | `TOGETHER_API_KEY` | trial credits | <https://api.together.xyz/settings/api-keys> |
+| **Ollama (local)** | `OLLAMA_BASE_URL` | **free, runs locally** | <https://ollama.com> |
+
+Override either the provider or the model explicitly:
+
+```bash
+export KEEPERKIT_LLM_PROVIDER=groq
+export KEEPERKIT_LLM_MODEL=llama-3.1-8b-instant
+```
+
+The `[server]` extra bundles `langchain-openai`, `langchain-anthropic`,
+`langchain-google-genai`, and `langchain-groq` so the most common providers
+work out of the box. For Mistral / Ollama install the matching extra
+(`pip install -e ".[mistral]"`, `".[ollama]"`).
+
+### All env vars
+
 | Env var | Default | What it does |
 |---|---|---|
 | `KEEPERHUB_API_KEY` | — | `kh_…` org key. Without it, the demo runs in mock mode. |
 | `KEEPERHUB_BASE_URL` | `https://app.keeperhub.com/api` | Override for self-hosted KeeperHub. |
 | `KEEPERKIT_MODE` | `real` | Set to `mock` to force the in-memory backend. |
-| `OPENAI_API_KEY` | — | Enables the LangChain ReAct agent in the demo. |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Override the model used by the demo agent. |
+| `KEEPERKIT_LLM_PROVIDER` | auto | Pin a provider (`openai`, `anthropic`, `google`, `groq`, `deepseek`, `openrouter`, `mistral`, `together`, `ollama`). |
+| `KEEPERKIT_LLM_MODEL` | provider-specific | Override the chat model for the active provider. |
+| `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL` | — | Standard OpenAI knobs. `OPENAI_BASE_URL` lets you point at LM Studio / vLLM / LiteLLM / Azure OpenAI proxies. |
+| `ANTHROPIC_API_KEY` | — | Enables Claude. |
+| `GOOGLE_API_KEY` | — | Enables Gemini. |
+| `GROQ_API_KEY` | — | Enables Groq. |
+| `DEEPSEEK_API_KEY` | — | Enables DeepSeek (via OpenAI-compatible endpoint). |
+| `OPENROUTER_API_KEY` | — | Enables OpenRouter (via OpenAI-compatible endpoint). |
+| `MISTRAL_API_KEY` | — | Enables Mistral. |
+| `TOGETHER_API_KEY` | — | Enables Together AI. |
+| `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | — | Use a local Ollama server. |
 | `KEEPERKIT_HOST` | `0.0.0.0` | Bind host for the demo server. |
 | `KEEPERKIT_PORT` | `8000` | Bind port for the demo server. |
 

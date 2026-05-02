@@ -30,6 +30,7 @@ from keeperkit import __version__
 from keeperkit.client import KeeperHubClient
 from keeperkit.exceptions import KeeperHubAPIError, KeeperHubAuthError
 from keeperkit.mock import MockKeeperHubClient
+from keeperkit.server.llm import detect_provider
 from keeperkit.tools._common import KEEPERHUB_TOOL_SPECS, default_dispatch, find_spec
 
 HERE = Path(__file__).resolve().parent
@@ -55,11 +56,16 @@ def _build_client() -> tuple[Any, str]:
 
 def _client_meta(client: Any, mode: str) -> dict[str, Any]:
     is_mock = isinstance(client, MockKeeperHubClient)
+    provider = detect_provider()
     return {
         "mode": mode,
         "is_mock": is_mock,
         "base_url": getattr(client, "base_url", "in-memory") if not is_mock else "in-memory",
         "version": __version__,
+        "llm_provider": provider or "heuristic",
+        "llm_model": (os.environ.get("KEEPERKIT_LLM_MODEL")
+                      or os.environ.get("OPENAI_MODEL")
+                      or None),
     }
 
 

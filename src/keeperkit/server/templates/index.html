@@ -26,6 +26,9 @@
       <span class="badge {% if meta.is_mock %}mock{% else %}live{% endif %}">
         backend: {{ meta.mode }}{% if meta.is_mock %} (in-memory){% endif %}
       </span>
+      <span class="badge {% if meta.llm_provider == 'heuristic' %}mock{% else %}live{% endif %}">
+        llm: {{ meta.llm_provider }}{% if meta.llm_model %} · {{ meta.llm_model }}{% endif %}
+      </span>
       <a class="badge link" href="https://github.com/danilaverbena/keeperkit"
          target="_blank" rel="noopener">github →</a>
       <a class="badge link" href="/api/elizaos/plugin.json"
