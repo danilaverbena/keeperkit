@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KeeperKit — KeeperHub plugin for AI agents</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="hero">
+  <div class="hero-inner">
+    <div class="brand">
+      <span class="logo">⛓️</span>
+      <span class="brand-text">KeeperKit</span>
+      <span class="version">v{{ meta.version }}</span>
+    </div>
+    <p class="tagline">
+      One import, three frameworks (LangChain · CrewAI · ElizaOS) — your AI
+      agent now ships transactions through
+      <a href="https://keeperhub.com" target="_blank" rel="noopener">KeeperHub's</a>
+      reliability layer with retry, gas opt, MEV-aware private routing,
+      and a full audit trail.
+    </p>
+    <div class="badges">
+      <span class="badge {% if meta.is_mock %}mock{% else %}live{% endif %}">
+        backend: {{ meta.mode }}{% if meta.is_mock %} (in-memory){% endif %}
+      </span>
+      <a class="badge link" href="https://github.com/danilaverbena/keeperkit"
+         target="_blank" rel="noopener">github →</a>
+      <a class="badge link" href="/api/elizaos/plugin.json"
+         target="_blank" rel="noopener">elizaos plugin.json →</a>
+      <a class="badge link" href="/docs" target="_blank" rel="noopener">openapi →</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section id="agent" class="card">
+    <h2>1 · Talk to the agent</h2>
+    <p class="muted">
+      A LangChain ReAct agent bound to every KeeperHub tool. Falls back to a
+      deterministic heuristic when no OpenAI key is configured. Try:
+    </p>
+    <ul class="examples">
+      <li><button class="example" data-prompt="Check the balance of 0x9c8f005ab27adb94f3d49020a15722db2fcd9f27 on Sepolia.">Check balance · Sepolia</button></li>
+      <li><button class="example" data-prompt="List the workflows already configured in this organization.">List workflows</button></li>
+      <li><button class="example" data-prompt="What web3 actions does KeeperHub support?">List web3 actions</button></li>
+      <li><button class="example" data-prompt="Transfer 0.001 ETH on Sepolia to 0x9c8f005ab27adb94f3d49020a15722db2fcd9f27 and tell me the tx hash.">Transfer 0.001 ETH</button></li>
+      <li><button class="example" data-prompt="Generate a workflow that sends me a Discord message every time my Sepolia wallet's balance drops below 0.05 ETH.">Generate a workflow</button></li>
+    </ul>
+    <textarea id="prompt" rows="3"
+      placeholder="Ask the agent to do something onchain — KeeperHub handles the execution layer."></textarea>
+    <div class="row">
+      <button id="run" class="primary">Run agent →</button>
+      <label class="muted"><input type="checkbox" id="forceMock"> force mock backend</label>
+    </div>
+    <pre id="agent-out" class="output"></pre>
+  </section>
+
+  <section id="tools" class="card">
+    <h2>2 · Direct tool dispatch</h2>
+    <p class="muted">
+      Call any KeeperHub tool without an LLM. Useful for plumbing, smoke
+      tests, or wiring KeeperKit into your own agent runtime.
+    </p>
+    <div class="tool-list">
+      {% for tool in tools %}
+      <details class="tool" data-name="{{ tool.name }}">
+        <summary>
+          <code>{{ tool.name }}</code>
+          <span class="tool-desc">{{ tool.description }}</span>
+        </summary>
+        <div class="tool-body">
+          <textarea class="tool-args" rows="4">{{ tool.parameters | tojson(indent=2) }}</textarea>
+          <button class="tool-run">Call →</button>
+          <pre class="tool-out"></pre>
+        </div>
+      </details>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section id="snippet" class="card">
+    <h2>3 · Drop into your agent</h2>
+    <p class="muted">All three framework adapters share the same tool catalogue.</p>
+    <div class="grid">
+      <div>
+        <h3>LangChain / LangGraph</h3>
+<pre><code>from keeperkit import KeeperHubClient
+from keeperkit.tools.langchain import build_langchain_tools
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+
+client = KeeperHubClient.from_env()
+tools = build_langchain_tools(client)
+agent = create_react_agent(ChatOpenAI(model="gpt-4o-mini"), tools)
+agent.invoke({"messages": [("user", "Send 0.01 ETH to 0xabc…")]})</code></pre>
+      </div>
+      <div>
+        <h3>CrewAI</h3>
+<pre><code>from keeperkit import KeeperHubClient
+from keeperkit.tools.crewai import build_crewai_tools
+from crewai import Agent
+
+client = KeeperHubClient.from_env()
+trader = Agent(
+    role="Onchain trader",
+    goal="Execute trades reliably on Sepolia.",
+    tools=build_crewai_tools(client),
+)</code></pre>
+      </div>
+      <div>
+        <h3>ElizaOS</h3>
+<pre><code># Generate the plugin descriptor your character imports:
+python -c "from keeperkit.tools.elizaos import write_elizaos_plugin; \
+           write_elizaos_plugin('./elizaos/plugin.json')"
+
+# Or fetch it from the live demo server:
+curl -s {{ request.base_url if request else 'https://your-server' }}api/elizaos/plugin.json</code></pre>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>KeeperKit · MIT · built for the
+    <a href="https://ethglobal.com/events/openagents" target="_blank"
+       rel="noopener">ETHGlobal OpenAgents</a> hackathon · sponsor:
+    <a href="https://keeperhub.com" target="_blank" rel="noopener">KeeperHub</a>.
+  </span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

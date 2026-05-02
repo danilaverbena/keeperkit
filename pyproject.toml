@@ -1,0 +1,80 @@
+[project]
+name = "keeperkit"
+version = "0.1.0"
+description = "Unified KeeperHub plugin for LangChain, CrewAI, and ElizaOS — give your agent reliable onchain execution in one import."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "KeeperKit contributors" },
+]
+requires-python = ">=3.10"
+keywords = ["keeperhub", "ai-agents", "langchain", "crewai", "elizaos", "web3", "ethereum", "mcp", "x402"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.5",
+    "anyio>=4.0",
+]
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.3.0"]
+crewai = ["crewai>=0.70.0"]
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "langchain-openai>=0.2",
+    "langchain>=0.3",
+    "langgraph>=0.2",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Repository = "https://github.com/danilaverbena/keeperkit"
+Issues = "https://github.com/danilaverbena/keeperkit/issues"
+KeeperHub = "https://keeperhub.com"
+
+[project.scripts]
+keeperkit-demo = "keeperkit.server.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/keeperkit"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N"]
+# * N815: pydantic models intentionally mirror KeeperHub's camelCase field
+#   names so JSON (de)serialisation stays one-to-one with the upstream API.
+# * N806: PEP-8 wants lowercase locals, but pydantic / langchain class names
+#   are PascalCase by convention; aliasing them locally would obscure intent.
+ignore = ["N815", "N806"]
+
+[tool.ruff.lint.per-file-ignores]
+# `pytest.importorskip` must run before the imports it guards.
+"tests/test_real_client_errors.py" = ["E402"]
+"tests/test_langchain_tools.py" = ["E402"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,348 @@
+{
+  "name": "@keeperkit/elizaos-plugin",
+  "version": "0.1.0",
+  "description": "KeeperHub onchain execution plugin for ElizaOS. Routes agent transactions through KeeperHub's reliable execution layer (retry, gas optimization, MEV-aware private routing, audit trail, x402 / MPP payment rails).",
+  "homepage": "https://github.com/danilaverbena/keeperkit",
+  "actions": [
+    {
+      "name": "keeperhub_list_workflows",
+      "description": "List workflows already configured in your KeeperHub organization. Use this to discover existing automations the agent can reuse instead of building from scratch.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 200
+          },
+          "offset": {
+            "type": "integer",
+            "default": 0,
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_list_workflows"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_get_workflow",
+      "description": "Fetch the full configuration (nodes + edges) of a workflow by id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "workflow_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow_id"
+        ],
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_get_workflow"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_execute_workflow",
+      "description": "Trigger a stored KeeperHub workflow by id and return the execution envelope. KeeperHub handles retries, gas optimization, simulation, and private MEV-aware routing.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "workflow_id": {
+            "type": "string"
+          },
+          "inputs": {
+            "type": "object",
+            "description": "Optional input payload passed to the workflow."
+          }
+        },
+        "required": [
+          "workflow_id"
+        ],
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_execute_workflow"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_get_execution_status",
+      "description": "Return the current status (pending/running/success/error/cancelled) of an execution by id, including per-node progress.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "execution_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "execution_id"
+        ],
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_get_execution_status"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_get_execution_logs",
+      "description": "Return per-node execution logs (input, output, duration, tx hashes) for an execution. Use this to give the user an audit trail.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "execution_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "execution_id"
+        ],
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_get_execution_logs"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_check_balance",
+      "description": "Read the native token balance of an address on a given EVM chain. No wallet integration is required.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "network": {
+            "type": "string",
+            "description": "EVM chain ID as a string. Common values: '1' (ethereum), '11155111' (sepolia), '8453' (base), '84532' (base_sepolia), '42161' (arbitrum), '137' (polygon), '10' (optimism), '130' (unichain)."
+          },
+          "address": {
+            "type": "string",
+            "description": "0x-prefixed address."
+          }
+        },
+        "required": [
+          "network",
+          "address"
+        ],
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_check_balance"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_transfer_funds",
+      "description": "Send native token (ETH/MATIC/etc.) reliably. KeeperHub adds retry logic, gas escalation, simulation-before-submit, and MEV-aware private routing. Requires a wallet integration ID.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "network": {
+            "type": "string",
+            "description": "EVM chain ID as a string. Common values: '1' (ethereum), '11155111' (sepolia), '8453' (base), '84532' (base_sepolia), '42161' (arbitrum), '137' (polygon), '10' (optimism), '130' (unichain)."
+          },
+          "to_address": {
+            "type": "string",
+            "description": "0x recipient address."
+          },
+          "amount": {
+            "type": "string",
+            "description": "Amount in ETH-units as a string (e.g. '0.1')."
+          },
+          "wallet_id": {
+            "type": "string",
+            "description": "KeeperHub wallet integration id (see `keeperhub_get_wallet_integration`)."
+          }
+        },
+        "required": [
+          "network",
+          "to_address",
+          "amount",
+          "wallet_id"
+        ],
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_transfer_funds"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_write_contract",
+      "description": "Call a state-changing contract function via KeeperHub's reliable execution path.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "network": {
+            "type": "string",
+            "description": "EVM chain ID as a string. Common values: '1' (ethereum), '11155111' (sepolia), '8453' (base), '84532' (base_sepolia), '42161' (arbitrum), '137' (polygon), '10' (optimism), '130' (unichain)."
+          },
+          "contract_address": {
+            "type": "string"
+          },
+          "function_name": {
+            "type": "string"
+          },
+          "wallet_id": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "items": {}
+          },
+          "value": {
+            "type": "string",
+            "description": "Optional native value to send."
+          }
+        },
+        "required": [
+          "network",
+          "contract_address",
+          "function_name",
+          "wallet_id"
+        ],
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_write_contract"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_list_action_schemas",
+      "description": "List the action types available on KeeperHub. Filter by category: web3, discord, sendgrid, webhook, system.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "web3",
+              "discord",
+              "sendgrid",
+              "webhook",
+              "system"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_list_action_schemas"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_ai_generate_workflow",
+      "description": "Ask KeeperHub's built-in workflow generator to produce a workflow from a natural-language description. Useful for skipping manual node-by-node construction.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "modify_workflow_id": {
+            "type": "string",
+            "description": "Optional id of an existing workflow to modify."
+          }
+        },
+        "required": [
+          "description"
+        ],
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_ai_generate_workflow"
+        }
+      }
+    },
+    {
+      "name": "keeperhub_get_wallet_integration",
+      "description": "Return the active wallet integration metadata, including the wallet_id needed by transfer/write actions.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "dispatch": {
+        "kind": "http",
+        "method": "POST",
+        "url": "https://app.keeperhub.com/api/keeperkit/dispatch",
+        "auth": "bearer:KEEPERHUB_API_KEY",
+        "body": {
+          "tool": "keeperhub_get_wallet_integration"
+        }
+      }
+    }
+  ],
+  "envVars": [
+    {
+      "name": "KEEPERHUB_API_KEY",
+      "required": true,
+      "description": "Organization API key (kh_...) from KeeperHub."
+    },
+    {
+      "name": "KEEPERHUB_BASE_URL",
+      "required": false,
+      "default": "https://app.keeperhub.com/api"
+    }
+  ]
+}

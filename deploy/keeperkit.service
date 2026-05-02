@@ -1,0 +1,26 @@
+[Unit]
+Description=KeeperKit demo server (FastAPI + LangChain ReAct + KeeperHub tools)
+Documentation=https://github.com/danilaverbena/keeperkit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/keeperkit
+EnvironmentFile=-/opt/keeperkit/.env
+ExecStart=/opt/keeperkit/.venv/bin/python -m keeperkit.server
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/keeperkit
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
