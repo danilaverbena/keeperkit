@@ -81,7 +81,7 @@ select = ["E", "F", "W", "I", "B", "UP", "N"]
 #   names so JSON (de)serialisation stays one-to-one with the upstream API.
 # * N806: PEP-8 wants lowercase locals, but pydantic / langchain class names
 #   are PascalCase by convention; aliasing them locally would obscure intent.
-ignore = ["N815", "N806"]
+ignore = ["N815", "N806", "N818"]
 
 [tool.ruff.lint.per-file-ignores]
 # `pytest.importorskip` must run before the imports it guards.

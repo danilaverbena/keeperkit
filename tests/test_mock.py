@@ -1,69 +1,83 @@
-from keeperkit import MockKeeperHubClient, Network, WorkflowBuilder
-from keeperkit.exceptions import KeeperHubNotFoundError
+"""Tests for the in-memory MockKeeperHubClient and its public-API parity."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from keeperkit import MockKeeperHubClient
+from keeperkit.exceptions import KeeperHubNotFoundError, KeeperHubPaymentRequired
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def test_create_and_execute_workflow():
+def test_default_catalogue_is_non_empty():
     client = MockKeeperHubClient()
-    wf = (
-        WorkflowBuilder("test")
-        .manual_trigger()
-        .action("balance", "web3/check-balance",
-                network=Network.SEPOLIA,
-                address="0x0000000000000000000000000000000000000001")
-        .build()
+    cat = client.list_workflows()
+    assert cat["items"]
+    # Each entry has the fields production /api/mcp/workflows returns.
+    for wf in cat["items"]:
+        assert {"id", "name", "listedSlug", "inputSchema", "workflowType"} <= set(wf)
+
+
+def test_real_catalogue_fixture_is_well_formed():
+    """Smoke test: the saved real-API snapshot still parses."""
+    raw = json.loads((FIXTURES / "keeperhub_catalogue.json").read_text())
+    assert "items" in raw
+    # Use the real snapshot as a mock catalogue and verify key methods.
+    client = MockKeeperHubClient(catalogue=raw["items"])
+    cat = client.list_workflows()
+    assert len(cat["items"]) == len(raw["items"])
+
+
+def test_helloworld_is_free_and_returns_executionid():
+    client = MockKeeperHubClient()
+    res = client.call_workflow("helloworld", {})
+    assert res["status"] == "success"
+    assert "executionId" in res
+    assert res["output"]["result"]["message"] == "Hello World!"
+
+
+def test_paid_workflow_raises_payment_required_without_token():
+    client = MockKeeperHubClient()
+    with pytest.raises(KeeperHubPaymentRequired) as excinfo:
+        client.call_workflow("aave-v3-health-check",
+                             {"address": "0x000000000000000000000000000000000000dEaD"})
+    err = excinfo.value
+    assert err.x402["x402Version"] == 2
+    assert err.x402["accepts"][0]["network"] == "eip155:8453"
+    assert err.amount_usdc  # not None
+
+
+def test_paid_workflow_succeeds_with_token():
+    client = MockKeeperHubClient()
+    res = client.call_workflow(
+        "aave-v3-health-check",
+        {"address": "0x000000000000000000000000000000000000dEaD"},
+        x_payment="mock-token",
     )
-    saved = client.create_workflow(wf)
-    assert saved.id is not None
-    assert len(saved.nodes) == 2
-    assert len(saved.edges) == 1
-
-    execution = client.execute_workflow(saved.id)
-    assert execution.status.value == "success"
-    assert execution.workflowId == saved.id
-
-    logs = client.get_execution_logs(execution.id)
-    assert len(logs) == 1
-    assert logs[0].status.value == "success"
-    assert logs[0].output is not None
-    assert logs[0].output["balance"] == "0.1234"
+    assert res["status"] == "success"
+    assert "healthFactor" in res["output"]["result"]
 
 
-def test_check_balance_shortcut():
+def test_unknown_slug_raises_not_found():
     client = MockKeeperHubClient()
-    out = client.check_balance("11155111", "0xabcdef0123456789abcdef0123456789abcdef01")
-    assert out["balance"] == "0.1234"
-    assert "executionId" in out
+    with pytest.raises(KeeperHubNotFoundError):
+        client.call_workflow("does-not-exist", {})
 
 
-def test_missing_workflow_404():
+def test_get_openapi_describes_listed_workflows():
     client = MockKeeperHubClient()
-    try:
-        client.get_workflow("wf_does_not_exist")
-    except KeeperHubNotFoundError:
-        pass
-    else:
-        raise AssertionError("expected KeeperHubNotFoundError")
+    spec = client.get_openapi()
+    paths = spec["paths"]
+    assert "/api/mcp/workflows/helloworld/call" in paths
+    schema = paths["/api/mcp/workflows/aave-v3-health-check/call"]["post"]
+    assert schema["summary"] == "Aave v3 Health Check"
 
 
-def test_transfer_returns_tx_metadata():
+def test_org_endpoints_return_lists():
     client = MockKeeperHubClient()
-    wallet = client.get_wallet_integration()
-    execution = client.transfer_funds(
-        "11155111",
-        "0x9c8f005ab27adb94f3d49020a15722db2fcd9f27",
-        "0.001",
-        wallet.id,
-    )
-    assert execution.status.value == "success"
-    output = execution.output or {}
-    assert output["status"] == "confirmed"
-    assert output["private"] is True
-    assert output["txHash"].startswith("0x")
-    assert output["transactionLink"].startswith("https://")
-
-
-def test_ai_generate_workflow_creates_real_workflow():
-    client = MockKeeperHubClient()
-    wf = client.ai_generate_workflow("send daily balance report")
-    assert wf.id is not None
-    assert any(n.type == "action" for n in wf.nodes)
+    assert isinstance(client.list_org_workflows(), list)
+    assert isinstance(client.list_integrations(), list)

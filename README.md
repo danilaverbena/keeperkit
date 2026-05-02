@@ -1,61 +1,57 @@
 # KeeperKit
 
-> 🛠️ Unified [KeeperHub](https://keeperhub.com) plugin for **LangChain**, **CrewAI**, and **ElizaOS** — give your AI agent reliable onchain execution in one import.
+> 🛠️ Unified [KeeperHub](https://keeperhub.com) plugin for **LangChain**, **CrewAI**, and **ElizaOS** — give your AI agent typed access to every KeeperHub workflow, with built-in [x402](https://x402.org) payment-required handling, in one import.
 
-[![Live demo](https://img.shields.io/badge/live%20demo-keeperkit.danilaverbena.dev-2dff7d?style=flat-square)](https://keeperkit.danilaverbena.dev)
+[![Live demo](https://img.shields.io/badge/live%20demo-178.104.45.97%3A8420-2dff7d?style=flat-square)](http://178.104.45.97:8420)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white&style=flat-square)](pyproject.toml)
 [![ETHGlobal OpenAgents](https://img.shields.io/badge/built%20for-ETHGlobal%20OpenAgents-orange?style=flat-square)](https://ethglobal.com/events/openagents/prizes/keeperhub)
 
 KeeperKit is the missing glue between modern AI agent frameworks and
-[KeeperHub](https://keeperhub.com), the execution and reliability layer powering
-[Sky Protocol](https://sky.money) (formerly MakerDAO). Drop it into any
-LangChain / CrewAI / ElizaOS agent and onchain transactions get retry
-discipline, gas escalation, simulation-before-submit, MEV-aware private
-routing, and a queryable audit trail — without rewriting your agent.
+[KeeperHub](https://keeperhub.com)'s public workflow catalogue. KeeperHub
+exposes a curated set of callable workflows (DeFi reads, payments, write
+transactions) under `POST /api/mcp/workflows/{slug}/call` — KeeperKit turns
+each one into a typed tool your LangChain / CrewAI / ElizaOS agent can call
+directly.
 
 ```text
 ┌──────────────────────────────────────────────────────┐
 │  Your agent (LangChain · CrewAI · ElizaOS · custom)  │
 └───────────────────────┬──────────────────────────────┘
                         │  one import
-            ┌───────────▼─────────────┐
-            │  KeeperKit tool catalog │
-            │  (12 tools, shared      │
-            │   spec + JSON schema)   │
-            └───────────┬─────────────┘
-                        │  HTTP / MCP
+            ┌───────────▼──────────────┐
+            │  KeeperKit tool catalogue│
+            │  • 5 static (discover/   │
+            │    call/openapi/integ.)  │
+            │  • 1 per workflow,       │
+            │    auto-generated from   │
+            │    /api/mcp/workflows    │
+            └───────────┬──────────────┘
+                        │  HTTP
                 ┌───────▼───────┐
-                │   KeeperHub   │  retry · gas opt · MEV-private routing
-                │   execution   │  audit trail · x402 / MPP payments
-                │     layer     │
+                │   KeeperHub   │  catalogue · simulate · retry · audit
+                │   workflows   │  + x402 micropayments (USDC on Base)
                 └───────┬───────┘
                         │
-                ┌───────▼────────┐
-                │  EVM chains    │  Ethereum · Base · Arbitrum · Polygon · …
-                └────────────────┘
+                ┌───────▼───────────────┐
+                │  EVM chains           │  Ethereum · Base · Optimism · …
+                └───────────────────────┘
 ```
 
 ---
 
 ## Why?
 
-KeeperHub already exposes a polished MCP server and REST API. But:
-
-* every framework wants tools shaped a little differently,
-* every team wires retry/error-handling slightly differently,
-* signing up for an API key takes a few minutes, which is too long for the
-  first hour of a hackathon.
-
-KeeperKit fixes all three:
+KeeperHub already exposes a polished public REST + MCP layer. The pain
+points KeeperKit removes:
 
 | Pain | KeeperKit answer |
 |---|---|
-| Boilerplate per framework | One tool catalog, three adapters (`build_langchain_tools`, `build_crewai_tools`, ElizaOS plugin descriptor). |
-| Reliability | Outer retry + backoff on top of KeeperHub's own retry. Exception types map to HTTP status. |
-| Local DX | `MockKeeperHubClient` is a drop-in stand-in: workflow CRUD, executions, logs, even AI-generated workflows. Ship code on a plane. |
-| ElizaOS friction | One Python call generates the action descriptor JSON your character imports. No Node toolchain needed. |
-| Demo / proof | `python -m keeperkit.server` boots a dashboard with a ReAct agent, direct tool dispatch, and live KeeperHub status. |
+| Each framework wants tools shaped a little differently | One shared `ToolSpec`, three thin adapters (`build_langchain_tools`, `build_crewai_tools`, `build_elizaos_plugin_descriptor`). |
+| Tools drift behind the workflow catalogue | Tools are **auto-generated** from `GET /api/mcp/workflows` at build time — new workflow = new tool, no code change. |
+| Paid (x402) workflows return HTTP 402 with a base64 descriptor | KeeperKit decodes it, raises `KeeperHubPaymentRequired`, and exposes `.x402` and `.amount_usdc` so your agent / x402 settlement layer can route the payment. |
+| Local DX | `MockKeeperHubClient` ships a representative catalogue with free + paid workflows so you can run the full `safe_dispatch` / 402 flow offline. |
+| Hackathon-grade demo | `python -m keeperkit.server` boots a FastAPI dashboard + ReAct agent + ElizaOS bridge in one command. |
 
 ---
 
@@ -84,17 +80,20 @@ from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
 client = KeeperHubClient.from_env()           # reads KEEPERHUB_API_KEY
-tools  = build_langchain_tools(client)        # 12 KeeperHub tools
+tools  = build_langchain_tools(client)        # 5 static + 1 per workflow
 agent  = create_react_agent(ChatOpenAI(model="gpt-4o-mini"), tools)
 
 agent.invoke({"messages": [(
     "user",
-    "Send 0.01 ETH to 0xabc… on Sepolia, then tell me the tx hash.",
+    "Check the Aave v3 health factor for 0xabc… and warn me if liquidation risk is high.",
 )]})
 ```
 
-The agent will call `keeperhub_get_wallet_integration` → `keeperhub_transfer_funds`
-→ `keeperhub_get_execution_status`, and KeeperHub takes care of the rest.
+Behind the scenes the agent inspects `keeperhub_list_workflows`, picks
+`keeperhub_aave_v3_health_check`, calls it with the typed `address` arg,
+and reads the `executionId` + `output` back. Paid workflows surface
+`{ok: false, error: "payment_required", x402: {...}, amount_usdc: ...}`
+so your x402 client can settle and replay with the `X-Payment` header.
 
 ### CrewAI
 
@@ -105,8 +104,8 @@ from crewai import Agent
 
 client = KeeperHubClient.from_env()
 trader = Agent(
-    role="Onchain trader",
-    goal="Execute trades reliably on Sepolia.",
+    role="Onchain ops",
+    goal="Use KeeperHub workflows to monitor and act on DeFi positions.",
     tools=build_crewai_tools(client),
     backstory="Always delegate execution to KeeperHub.",
 )
@@ -117,8 +116,10 @@ trader = Agent(
 ```bash
 # Generate the plugin descriptor your character file imports.
 python - <<'PY'
+from keeperkit import KeeperHubClient
 from keeperkit.tools.elizaos import write_elizaos_plugin
-write_elizaos_plugin("./elizaos/keeperkit-plugin.json")
+write_elizaos_plugin("./elizaos/keeperkit-plugin.json",
+                     client=KeeperHubClient.from_env())
 PY
 ```
 
@@ -139,23 +140,64 @@ guide.
 
 ## Tool catalogue
 
-All adapters share the same 12 tools, defined in
+KeeperKit exposes two layers of tools, all defined in
 [`keeperkit/tools/_common.py`](src/keeperkit/tools/_common.py):
+
+### Static tools (always present)
 
 | Tool | What it does |
 |---|---|
-| `keeperhub_list_workflows` | List configured workflows in your org. |
-| `keeperhub_get_workflow` | Fetch a workflow's full nodes + edges. |
-| `keeperhub_execute_workflow` | Trigger a stored workflow with optional inputs. |
-| `keeperhub_get_execution_status` | Poll execution state + per-node progress. |
-| `keeperhub_get_execution_logs` | Audit trail with tx hashes, durations, errors. |
-| `keeperhub_check_balance` | Read native balance on any supported EVM chain. |
-| `keeperhub_transfer_funds` | Send native token via KeeperHub's reliable path. |
-| `keeperhub_write_contract` | Call a state-changing contract function reliably. |
-| `keeperhub_list_action_schemas` | Discover available KeeperHub actions. |
-| `keeperhub_ai_generate_workflow` | Use KeeperHub's LLM to spawn a workflow from prose. |
-| `keeperhub_get_wallet_integration` | Resolve the wallet ID needed for write actions. |
-| (more added over time) | — |
+| `keeperhub_list_workflows` | Discover the public workflow catalogue (`GET /api/mcp/workflows`). Returns slug, input schema, price, type, chain. |
+| `keeperhub_call_workflow` | Universal escape hatch: call any workflow by slug with a free-form body. Forwards `X-Payment` if supplied. |
+| `keeperhub_get_openapi` | Fetch the full OpenAPI 3.1 spec for the public API. |
+| `keeperhub_list_org_workflows` | List workflows scoped to your organization (`GET /api/workflows`). |
+| `keeperhub_list_integrations` | List wallet integrations attached to your org. |
+
+### Auto-generated per-workflow tools
+
+For every workflow returned by `GET /api/mcp/workflows`, KeeperKit creates a
+typed tool whose:
+
+* **name** is `keeperhub_<slug-as-ident>` (e.g. `keeperhub_aave_v3_health_check`)
+* **JSON schema** is copied verbatim from the workflow's `inputSchema`
+* **description** includes the workflow type (`read` / `write`), price, and chain
+* **dispatch** is a closure that calls `client.call_workflow(slug, body)` and
+  routes 402 errors through `safe_dispatch()` so the agent gets a clean
+  `{ok: false, error: "payment_required", x402: {...}}` response.
+
+This means the agent's tool surface follows the catalogue automatically —
+add a new workflow on KeeperHub and your agent picks it up on next
+restart.
+
+---
+
+## Handling paid workflows (x402)
+
+KeeperHub bills paid workflows via [x402](https://x402.org): the server
+returns `HTTP 402` with a base64-encoded payment descriptor in the
+`x-payment-requirements` header. KeeperKit decodes it for you:
+
+```python
+from keeperkit import KeeperHubClient
+from keeperkit.exceptions import KeeperHubPaymentRequired
+
+client = KeeperHubClient.from_env()
+try:
+    client.call_workflow("aave-v3-health-check", {"address": "0x..."})
+except KeeperHubPaymentRequired as exc:
+    # exc.x402 is the decoded descriptor
+    print("amount:", exc.amount_usdc, "atomic USDC")
+    print("network:", exc.x402["accepts"][0]["network"])
+    print("payTo:", exc.x402["accepts"][0]["payTo"])
+    # → settle via your x402 client (agentcash, openclaw, custom signer)
+    # → then replay with X-Payment header:
+    client.call_workflow("aave-v3-health-check", {"address": "0x..."},
+                         x_payment="<base64 settlement token>")
+```
+
+When the agent calls a paid tool, `safe_dispatch` converts the exception
+into a structured response so the LLM can reason about it (e.g. "this is
+$0.01 — pay or skip?") rather than crash.
 
 ---
 
@@ -169,9 +211,9 @@ client = MockKeeperHubClient()                # zero credentials needed
 tools  = build_langchain_tools(client)
 ```
 
-The mock matches the real client's surface 1:1: workflow CRUD, executions
-with deterministic `txHash` / `transactionLink`, logs, action schemas, AI
-generation. Every framework adapter accepts it — so you can write your demo
+The mock matches the real client's surface 1:1: catalogue, OpenAPI,
+`call_workflow` with deterministic `executionId`, full 402 flow, org
+endpoints. Every framework adapter accepts it — so you can write your demo
 flow before anyone on your team has signed up for KeeperHub.
 
 When you're ready to hit the real API, swap one line:
@@ -197,15 +239,23 @@ python -m keeperkit.server                    # serves at http://0.0.0.0:8000
 
 What you get:
 
-* **Dashboard** at `/` — live status badge, prompt box, direct tool dispatch.
-* **`POST /api/agent/run`** — LangChain ReAct agent. Auto-picks OpenAI,
-  Anthropic, Google Gemini, Groq, DeepSeek, OpenRouter, Mistral, Together, or
-  Ollama based on which API key is set; falls back to an LLM-less heuristic
-  if none are configured.
-* **`POST /api/tools/{name}`** — one-shot dispatch to any KeeperKit tool.
-* **`GET /api/elizaos/plugin.json`** — live ElizaOS plugin descriptor.
+* **Dashboard** at `/` — backend / LLM / tool count badges, live agent box,
+  per-tool dispatch panels.
+* **`POST /api/agent/run`** — LangChain ReAct agent over the full catalogue.
+  Auto-picks OpenAI, Anthropic, Google Gemini, Groq, DeepSeek, OpenRouter,
+  Mistral, Together, or Ollama based on which API key is set; falls back
+  to a deterministic heuristic when no LLM key is configured.
+* **`POST /api/tools/{name}`** — one-shot dispatch to any KeeperKit tool
+  (static or per-workflow).
+* **`POST /api/tools/_refresh`** — re-discover the workflow catalogue
+  without restarting (handy after publishing a new workflow on KeeperHub).
+* **`GET /api/elizaos/plugin.json`** — live ElizaOS plugin descriptor that
+  includes one action per discoverable workflow.
 * **`POST /keeperkit/dispatch`** — bridge endpoint for the ElizaOS plugin.
 * **`/docs`** — full OpenAPI spec.
+
+Live demo (mock + heuristic, no LLM key required):
+**<http://178.104.45.97:8420>**.
 
 ---
 
@@ -215,7 +265,7 @@ What you get:
 
 1. Sign up / log in at <https://keeperhub.com>.
 2. Open or create an **Organization** (top-right menu — *Personal* keys cannot
-   execute workflows).
+   call workflows).
 3. **Settings → API Keys → Organisation tab → New API Key.**
 4. Copy the `kh_…` token into `KEEPERHUB_API_KEY`.
 
@@ -249,11 +299,6 @@ export KEEPERKIT_LLM_PROVIDER=groq
 export KEEPERKIT_LLM_MODEL=llama-3.1-8b-instant
 ```
 
-The `[server]` extra bundles `langchain-openai`, `langchain-anthropic`,
-`langchain-google-genai`, and `langchain-groq` so the most common providers
-work out of the box. For Mistral / Ollama install the matching extra
-(`pip install -e ".[mistral]"`, `".[ollama]"`).
-
 ### All env vars
 
 | Env var | Default | What it does |
@@ -264,14 +309,6 @@ work out of the box. For Mistral / Ollama install the matching extra
 | `KEEPERKIT_LLM_PROVIDER` | auto | Pin a provider (`openai`, `anthropic`, `google`, `groq`, `deepseek`, `openrouter`, `mistral`, `together`, `ollama`). |
 | `KEEPERKIT_LLM_MODEL` | provider-specific | Override the chat model for the active provider. |
 | `OPENAI_API_KEY` / `OPENAI_MODEL` / `OPENAI_BASE_URL` | — | Standard OpenAI knobs. `OPENAI_BASE_URL` lets you point at LM Studio / vLLM / LiteLLM / Azure OpenAI proxies. |
-| `ANTHROPIC_API_KEY` | — | Enables Claude. |
-| `GOOGLE_API_KEY` | — | Enables Gemini. |
-| `GROQ_API_KEY` | — | Enables Groq. |
-| `DEEPSEEK_API_KEY` | — | Enables DeepSeek (via OpenAI-compatible endpoint). |
-| `OPENROUTER_API_KEY` | — | Enables OpenRouter (via OpenAI-compatible endpoint). |
-| `MISTRAL_API_KEY` | — | Enables Mistral. |
-| `TOGETHER_API_KEY` | — | Enables Together AI. |
-| `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | — | Use a local Ollama server. |
 | `KEEPERKIT_HOST` | `0.0.0.0` | Bind host for the demo server. |
 | `KEEPERKIT_PORT` | `8000` | Bind port for the demo server. |
 
@@ -281,13 +318,14 @@ work out of the box. For Mistral / Ollama install the matching extra
 
 ```bash
 pip install -e ".[langchain,crewai,server,dev]"
-pytest -q                                # mock + langchain + REST error tests
+pytest -q                                # mock + langchain + REST + elizaos
 ruff check src tests
 ```
 
 The test suite uses [respx](https://github.com/lundberg/respx) to fake the
-KeeperHub REST API so you can run it offline. Mock-backed integration tests
-live in `tests/test_mock.py`.
+KeeperHub REST API so you can run it offline. Mock-backed integration
+tests live in `tests/test_mock.py`. Captured real-API snapshots in
+`tests/fixtures/` keep the mock honest.
 
 ---
 
@@ -298,13 +336,13 @@ on **both** focus areas:
 
 * **Focus area 1 — Innovative Use:** the demo server's heuristic + ReAct
   agent shows KeeperHub turning into the execution backbone of a generic
-  agent framework. The ElizaOS plugin descriptor is generated dynamically
-  from the same shared catalogue.
+  agent framework, with full x402 payment-required handling so paid
+  workflows are reasoned about instead of crashing.
 * **Focus area 2 — Integration:** ready-to-use plugin/SDK integrations for
   three of the active builder communities listed in the prize description
-  (LangChain, CrewAI, ElizaOS). Plus the
-  [Builder Feedback Bounty](FEEDBACK.md) submission with concrete
-  reproducible findings.
+  (LangChain, CrewAI, ElizaOS) — all sharing one auto-generated tool
+  catalogue. Plus the [Builder Feedback Bounty](FEEDBACK.md) submission
+  with concrete reproducible findings from a real integration.
 
 ---
 
@@ -313,13 +351,11 @@ on **both** focus areas:
 ```
 keeperkit/
 ├── src/keeperkit/
-│   ├── client.py            # sync + async REST client w/ retry + error mapping
-│   ├── mock.py              # in-memory backend
-│   ├── workflow.py          # WorkflowBuilder DSL
-│   ├── models.py            # pydantic models
-│   ├── exceptions.py        # KeeperHubAPIError hierarchy
+│   ├── client.py            # sync + async REST client + x402 decoding
+│   ├── mock.py              # in-memory backend with full 402 flow
+│   ├── exceptions.py        # KeeperHubAPIError + KeeperHubPaymentRequired
 │   ├── tools/
-│   │   ├── _common.py       # shared 12-tool catalogue
+│   │   ├── _common.py       # ToolSpec + safe_dispatch + auto-generation
 │   │   ├── langchain.py     # StructuredTool factory
 │   │   ├── crewai.py        # crewai.tools.BaseTool factory
 │   │   └── elizaos.py       # plugin descriptor generator

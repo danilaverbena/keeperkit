@@ -17,10 +17,11 @@
     </div>
     <p class="tagline">
       One import, three frameworks (LangChain · CrewAI · ElizaOS) — your AI
-      agent now ships transactions through
-      <a href="https://keeperhub.com" target="_blank" rel="noopener">KeeperHub's</a>
-      reliability layer with retry, gas opt, MEV-aware private routing,
-      and a full audit trail.
+      agent gets typed access to every
+      <a href="https://keeperhub.com" target="_blank" rel="noopener">KeeperHub</a>
+      workflow (DeFi reads, payments, write transactions) with built-in
+      x402 payment-required handling. Tools are auto-generated from the
+      live <code>/api/mcp/workflows</code> catalogue.
     </p>
     <div class="badges">
       <span class="badge {% if meta.is_mock %}mock{% else %}live{% endif %}">
@@ -28,6 +29,9 @@
       </span>
       <span class="badge {% if meta.llm_provider == 'heuristic' %}mock{% else %}live{% endif %}">
         llm: {{ meta.llm_provider }}{% if meta.llm_model %} · {{ meta.llm_model }}{% endif %}
+      </span>
+      <span class="badge live">
+        tools: {{ meta.tool_count }}
       </span>
       <a class="badge link" href="https://github.com/danilaverbena/keeperkit"
          target="_blank" rel="noopener">github →</a>
@@ -43,14 +47,14 @@
     <h2>1 · Talk to the agent</h2>
     <p class="muted">
       A LangChain ReAct agent bound to every KeeperHub tool. Falls back to a
-      deterministic heuristic when no OpenAI key is configured. Try:
+      deterministic heuristic when no LLM key is configured. Try:
     </p>
     <ul class="examples">
-      <li><button class="example" data-prompt="Check the balance of 0x9c8f005ab27adb94f3d49020a15722db2fcd9f27 on Sepolia.">Check balance · Sepolia</button></li>
-      <li><button class="example" data-prompt="List the workflows already configured in this organization.">List workflows</button></li>
-      <li><button class="example" data-prompt="What web3 actions does KeeperHub support?">List web3 actions</button></li>
-      <li><button class="example" data-prompt="Transfer 0.001 ETH on Sepolia to 0x9c8f005ab27adb94f3d49020a15722db2fcd9f27 and tell me the tx hash.">Transfer 0.001 ETH</button></li>
-      <li><button class="example" data-prompt="Generate a workflow that sends me a Discord message every time my Sepolia wallet's balance drops below 0.05 ETH.">Generate a workflow</button></li>
+      <li><button class="example" data-prompt="Say hello via the KeeperHub helloworld workflow.">helloworld smoke test</button></li>
+      <li><button class="example" data-prompt="List the KeeperHub workflow catalogue and explain what each one does.">List catalogue</button></li>
+      <li><button class="example" data-prompt="Check the Aave v3 health factor for 0x9c8f005ab27adb94f3d49020a15722db2fcd9f27.">Aave v3 health (paid)</button></li>
+      <li><button class="example" data-prompt="Aggregate DeFi positions on Base for wallet 0x9c8f005ab27adb94f3d49020a15722db2fcd9f27.">DeFi positions · Base</button></li>
+      <li><button class="example" data-prompt="Send a 0.01 USDC microtip to 0x9c8f005ab27adb94f3d49020a15722db2fcd9f27 on Base.">USDC microtip · Base</button></li>
     </ul>
     <textarea id="prompt" rows="3"
       placeholder="Ask the agent to do something onchain — KeeperHub handles the execution layer."></textarea>
@@ -96,9 +100,9 @@ from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
 client = KeeperHubClient.from_env()
-tools = build_langchain_tools(client)
+tools = build_langchain_tools(client)  # auto-generates one tool per workflow
 agent = create_react_agent(ChatOpenAI(model="gpt-4o-mini"), tools)
-agent.invoke({"messages": [("user", "Send 0.01 ETH to 0xabc…")]})</code></pre>
+agent.invoke({"messages": [("user", "Check Aave v3 health for 0xabc…")]})</code></pre>
       </div>
       <div>
         <h3>CrewAI</h3>
@@ -108,8 +112,8 @@ from crewai import Agent
 
 client = KeeperHubClient.from_env()
 trader = Agent(
-    role="Onchain trader",
-    goal="Execute trades reliably on Sepolia.",
+    role="Onchain ops",
+    goal="Use KeeperHub workflows to monitor and act on DeFi positions.",
     tools=build_crewai_tools(client),
 )</code></pre>
       </div>
