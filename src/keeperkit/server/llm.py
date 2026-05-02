@@ -101,7 +101,11 @@ def _build_for_provider(provider: str) -> ProviderResolver:
 
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        chosen = model or "gemini-1.5-flash"
+        # gemini-1.5-flash is being decommissioned through 2025-2026; the
+        # 2.0/2.5 flash models are GA on the same free-tier API key. We
+        # default to 2.0-flash because it has the broadest tool-calling
+        # support and the most generous free quota at time of writing.
+        chosen = model or "gemini-2.0-flash"
         api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
         return (ChatGoogleGenerativeAI(model=chosen, temperature=0,
                                        google_api_key=api_key),
