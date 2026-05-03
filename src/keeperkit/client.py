@@ -1,40 +1,41 @@
-"""Sync + async HTTP clients for the KeeperHub REST API.
+"""Sync + async HTTP clients for the KeeperHub public REST API.
 
-The client is intentionally thin — it does request shaping, auth, retries,
-error mapping, and Pydantic deserialization, then exposes one method per
-KeeperHub action. Higher-level UX (LangChain Tools, CrewAI Tools, workflow
-DSL) is built on top of this.
+The KeeperHub public API exposes **callable workflows** rather than CRUD
+primitives. Discovery happens via :meth:`KeeperHubClient.list_workflows`
+(``GET /api/mcp/workflows``) and execution via
+:meth:`KeeperHubClient.call_workflow` (``POST /api/mcp/workflows/{slug}/call``).
+The full per-workflow JSON Schema is published at
+:meth:`KeeperHubClient.get_openapi` (``GET /api/openapi``).
 
-Notes:
-* Auth is via ``Authorization: Bearer kh_...`` (an *organization* API key).
-* Base URL defaults to ``https://app.keeperhub.com/api`` and is overridable.
-* Network/transient failures are retried with exponential backoff so an agent
-  can survive transient gas spikes / RPC failovers without writing its own
-  retry logic. KeeperHub itself also retries onchain — this is the *outer*
-  layer protecting the API call to KeeperHub.
+Auth is via ``Authorization: Bearer kh_...`` (an *organization* API key).
+The ``kh_…`` token authenticates *who* is calling but it does **not** pay
+for paid workflows. Paid workflows respond with HTTP 402 and an x402
+``payment-required`` header; surface that back to the caller as a
+:class:`KeeperHubPaymentRequired` exception so an x402 client (agentcash,
+openclaw, the upstream caller, etc.) can do the actual settlement and
+replay.
+
+Org-scoped helpers (``list_org_workflows``, ``list_integrations``) are kept
+so a builder-side agent can enumerate the workflows and wallet integrations
+it owns.
 """
 
 from __future__ import annotations
 
 import os
 import time
+from base64 import b64decode
 from typing import Any
 
 import anyio
 import httpx
-from pydantic import BaseModel, TypeAdapter
 
 from keeperkit.exceptions import (
     KeeperHubAPIError,
     KeeperHubAuthError,
     KeeperHubNotFoundError,
+    KeeperHubPaymentRequired,
     KeeperHubValidationError,
-)
-from keeperkit.models import (
-    ExecutionLogEntry,
-    WalletIntegration,
-    Workflow,
-    WorkflowExecution,
 )
 
 DEFAULT_BASE_URL = "https://app.keeperhub.com/api"
@@ -43,9 +44,41 @@ DEFAULT_USER_AGENT = "keeperkit/0.1.0 (+https://github.com/danilaverbena/keeperk
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
+def _decode_x402_header(value: str | None) -> dict[str, Any] | None:
+    """Decode the base64 JSON blob in the ``payment-required`` /
+    ``x-payment-requirements`` headers KeeperHub returns on 402."""
+    if not value:
+        return None
+    try:
+        # Add padding if missing.
+        pad = "=" * (-len(value) % 4)
+        raw = b64decode(value + pad)
+        import json
+        return json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - non-fatal, headers are optional
+        return None
+
+
 def _raise_for_status(resp: httpx.Response) -> None:
     if resp.is_success:
         return
+
+    if resp.status_code == 402:
+        # Paid workflow — surface as a payment-required exception so callers
+        # can route through their x402 client.
+        x402 = (_decode_x402_header(resp.headers.get("x-payment-requirements"))
+                or _decode_x402_header(resp.headers.get("payment-required")))
+        try:
+            body = resp.json()
+        except Exception:  # noqa: BLE001
+            body = resp.text
+        raise KeeperHubPaymentRequired(
+            "KeeperHub workflow requires payment (HTTP 402).",
+            x402=x402,
+            payload=body,
+            www_authenticate=resp.headers.get("www-authenticate"),
+        )
+
     payload: Any
     try:
         payload = resp.json()
@@ -64,16 +97,6 @@ def _raise_for_status(resp: httpx.Response) -> None:
     if resp.status_code == 400:
         raise KeeperHubValidationError(message, status_code=resp.status_code, payload=payload)
     raise KeeperHubAPIError(message, status_code=resp.status_code, payload=payload)
-
-
-def _coerce(model: type[BaseModel], data: Any) -> Any:
-    """Turn a JSON dict / list into a Pydantic model (or list of models)."""
-    if isinstance(data, dict) and "data" in data and len(data) <= 2:
-        # Common envelope shape: ``{"data": [...]}``
-        data = data["data"]
-    if isinstance(data, list):
-        return TypeAdapter(list[model]).validate_python(data)
-    return model.model_validate(data)
 
 
 class _BaseClient:
@@ -118,13 +141,17 @@ class KeeperHubClient(_BaseClient):
                                   timeout=self.timeout)
 
     # ------------------------------------------------------------------ helpers
-    def _request(self, method: str, path: str, *, json: Any = None,
-                 params: dict[str, Any] | None = None) -> Any:
+    def _request(
+        self, method: str, path: str, *, json: Any = None,
+        params: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> Any:
         last_exc: Exception | None = None
         delay = self.backoff_initial
         for attempt in range(self.max_retries + 1):
             try:
-                resp = self._http.request(method, path, json=json, params=params)
+                resp = self._http.request(method, path, json=json, params=params,
+                                          headers=extra_headers)
                 if resp.status_code in RETRYABLE_STATUS and attempt < self.max_retries:
                     time.sleep(delay)
                     delay *= 2
@@ -150,143 +177,80 @@ class KeeperHubClient(_BaseClient):
         """Build a client from environment variables."""
         return cls(**kw)
 
-    # ----------------------------------------------------------------- workflows
-    def list_workflows(self, *, limit: int = 50, offset: int = 0) -> list[Workflow]:
-        data = self._request("GET", "/workflows", params={"limit": limit, "offset": offset})
-        return _coerce(Workflow, data)
+    # --------------------------------------------------------- discovery (public)
+    def list_workflows(self) -> dict[str, Any]:
+        """List discoverable workflows (public catalogue).
 
-    def get_workflow(self, workflow_id: str) -> Workflow:
-        data = self._request("GET", f"/workflows/{workflow_id}")
-        return _coerce(Workflow, data)
-
-    def create_workflow(self, workflow: Workflow | dict[str, Any]) -> Workflow:
-        if isinstance(workflow, Workflow):
-            body: Any = workflow.model_dump(by_alias=True, exclude_none=True)
-        else:
-            body = workflow
-        data = self._request("POST", "/workflows", json=body)
-        return _coerce(Workflow, data)
-
-    def update_workflow(self, workflow_id: str, patch: dict[str, Any]) -> Workflow:
-        data = self._request("PATCH", f"/workflows/{workflow_id}", json=patch)
-        return _coerce(Workflow, data)
-
-    def delete_workflow(self, workflow_id: str, *, force: bool = False) -> None:
-        self._request("DELETE", f"/workflows/{workflow_id}",
-                      params={"force": "true"} if force else None)
-
-    # ----------------------------------------------------------------- execution
-    def execute_workflow(self, workflow_id: str,
-                         inputs: dict[str, Any] | None = None) -> WorkflowExecution:
-        data = self._request("POST", f"/workflows/{workflow_id}/execute",
-                             json={"input": inputs or {}})
-        return _coerce(WorkflowExecution, data)
-
-    def get_execution_status(self, execution_id: str) -> WorkflowExecution:
-        data = self._request("GET", f"/workflows/executions/{execution_id}/status")
-        return _coerce(WorkflowExecution, data)
-
-    def get_execution_logs(self, execution_id: str) -> list[ExecutionLogEntry]:
-        data = self._request("GET", f"/workflows/executions/{execution_id}/logs")
-        return _coerce(ExecutionLogEntry, data)
-
-    def list_executions(self, workflow_id: str) -> list[WorkflowExecution]:
-        data = self._request("GET", f"/workflows/{workflow_id}/executions")
-        return _coerce(WorkflowExecution, data)
-
-    def wait_for_execution(self, execution_id: str, *, timeout: float = 120.0,
-                           poll_interval: float = 2.0) -> WorkflowExecution:
-        """Poll an execution until it reaches a terminal state, then return it.
-
-        Terminal states: ``success``, ``error``, ``failed``, ``cancelled``,
-        ``completed``. Raises :class:`KeeperHubAPIError` on timeout.
+        ``GET /api/mcp/workflows`` — returns ``{"items": [...]}`` where each
+        item has ``listedSlug``, ``inputSchema``, ``priceUsdcPerCall``,
+        ``workflowType`` (``"read"`` or ``"write"``), ``category``, ``chain``.
         """
-        deadline = time.monotonic() + timeout
-        while True:
-            execution = self.get_execution_status(execution_id)
-            if execution.status.value in ("success", "error", "failed",
-                                          "cancelled", "completed"):
-                return execution
-            if time.monotonic() > deadline:
-                raise KeeperHubAPIError(
-                    f"Timed out waiting for execution {execution_id}; last status="
-                    f"{execution.status.value}"
-                )
-            time.sleep(poll_interval)
+        data = self._request("GET", "/mcp/workflows")
+        if isinstance(data, list):
+            return {"items": data}
+        return data or {"items": []}
 
-    # ---------------------------------------------------------------- one-shots
-    def execute_action(self, action_type: str, config: dict[str, Any], *,
-                       network: str | None = None) -> WorkflowExecution:
-        """Convenience: build a single-action workflow, run it, return execution.
+    def get_openapi(self) -> dict[str, Any]:
+        """Fetch KeeperHub's OpenAPI document (``GET /api/openapi``).
 
-        Internally this calls KeeperHub's ``/api/execute`` endpoint, which lets
-        you fire a single web3 action without first creating a stored workflow.
+        The document includes per-workflow JSON Schemas under
+        ``paths['/api/mcp/workflows/{slug}/call']``, x-payment-info, and
+        worked examples in ``info.x-guidance``.
         """
-        body = {"actionType": action_type, "config": dict(config)}
-        if network is not None:
-            body["config"].setdefault("network", network)
-        data = self._request("POST", "/execute", json=body)
-        return _coerce(WorkflowExecution, data)
+        return self._request("GET", "/openapi") or {}
 
-    def check_balance(self, network: str, address: str) -> dict[str, Any]:
-        execution = self.execute_action(
-            "web3/check-balance",
-            {"network": network, "address": address},
-        )
-        return (execution.output or {}) | {"executionId": execution.id}
+    # --------------------------------------------------------- execution (public)
+    def call_workflow(
+        self,
+        slug: str,
+        body: dict[str, Any] | None = None,
+        *,
+        x_payment: str | None = None,
+    ) -> dict[str, Any]:
+        """Invoke a KeeperHub workflow.
 
-    def transfer_funds(self, network: str, to_address: str, amount: str,
-                       wallet_id: str) -> WorkflowExecution:
-        return self.execute_action(
-            "web3/transfer-funds",
-            {"network": network, "toAddress": to_address,
-             "amount": amount, "walletId": wallet_id},
-        )
+        ``POST /api/mcp/workflows/{slug}/call``. ``body`` must satisfy the
+        workflow's ``inputSchema`` (see :meth:`list_workflows`). For paid
+        workflows, pass an x402 payment token in ``x_payment`` (the value that
+        goes into the ``X-Payment`` header per x402 v2). Without it, the
+        server returns HTTP 402 and this method raises
+        :class:`KeeperHubPaymentRequired` carrying the decoded payment
+        descriptor for downstream settlement.
 
-    def write_contract(self, network: str, contract_address: str, function_name: str,
-                       wallet_id: str, args: list[Any] | None = None,
-                       value: str | None = None) -> WorkflowExecution:
-        config: dict[str, Any] = {
-            "network": network,
-            "contractAddress": contract_address,
-            "functionName": function_name,
-            "walletId": wallet_id,
-        }
-        if args is not None:
-            config["args"] = args
-        if value is not None:
-            config["value"] = value
-        return self.execute_action("web3/write-contract", config)
+        Returns the parsed JSON response, typically
+        ``{"executionId": ..., "status": ..., "output": {...}}``.
+        """
+        extra: dict[str, str] | None = None
+        if x_payment:
+            extra = {"X-Payment": x_payment}
+        return self._request("POST", f"/mcp/workflows/{slug}/call",
+                             json=body or {}, extra_headers=extra) or {}
 
-    # --------------------------------------------------------------- integrations
-    def list_integrations(self, *, type: str | None = None) -> list[dict[str, Any]]:
-        data = self._request("GET", "/integrations",
-                             params={"type": type} if type else None)
+    # ----------------------------------------------------- builder-side helpers
+    def list_org_workflows(self) -> list[dict[str, Any]]:
+        """List the *organization's* workflows (builder view).
+
+        ``GET /api/workflows`` returns workflows owned by the org tied to the
+        ``kh_…`` key — useful for an agent that operates on its own
+        workflows. Public/discoverable workflows belonging to *other* orgs
+        only appear via :meth:`list_workflows`.
+        """
+        data = self._request("GET", "/workflows") or []
         if isinstance(data, dict) and "data" in data:
             data = data["data"]
         return data or []
 
-    def get_wallet_integration(self) -> WalletIntegration | None:
-        wallets = self.list_integrations(type="web3")
-        if not wallets:
-            return None
-        return WalletIntegration.model_validate(wallets[0])
+    def list_integrations(self) -> list[dict[str, Any]]:
+        """List wallet / external integrations configured on the org.
 
-    def list_action_schemas(self, *, category: str | None = None) -> list[dict[str, Any]]:
-        data = self._request("GET", "/action-schemas",
-                             params={"category": category} if category else None)
+        ``GET /api/integrations``. Each entry typically contains a chain id,
+        a connector name, and an opaque integration id usable in workflow
+        bodies. Returns ``[]`` for orgs that have no integrations yet.
+        """
+        data = self._request("GET", "/integrations") or []
         if isinstance(data, dict) and "data" in data:
             data = data["data"]
         return data or []
-
-    # -------------------------------------------------------------- ai-generated
-    def ai_generate_workflow(self, description: str, *,
-                             modify_workflow_id: str | None = None) -> Workflow:
-        body: dict[str, Any] = {"prompt": description}
-        if modify_workflow_id:
-            body["workflowId"] = modify_workflow_id
-        data = self._request("POST", "/workflows/ai-generate", json=body)
-        return _coerce(Workflow, data)
 
     # -------------------------------------------------------------- housekeeping
     def close(self) -> None:
@@ -307,13 +271,17 @@ class AsyncKeeperHubClient(_BaseClient):
         self._http = httpx.AsyncClient(base_url=self.base_url, headers=self.headers,
                                        timeout=self.timeout)
 
-    async def _request(self, method: str, path: str, *, json: Any = None,
-                       params: dict[str, Any] | None = None) -> Any:
+    async def _request(
+        self, method: str, path: str, *, json: Any = None,
+        params: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> Any:
         last_exc: Exception | None = None
         delay = self.backoff_initial
         for attempt in range(self.max_retries + 1):
             try:
-                resp = await self._http.request(method, path, json=json, params=params)
+                resp = await self._http.request(method, path, json=json, params=params,
+                                                headers=extra_headers)
                 if resp.status_code in RETRYABLE_STATUS and attempt < self.max_retries:
                     await anyio.sleep(delay)
                     delay *= 2
@@ -337,43 +305,39 @@ class AsyncKeeperHubClient(_BaseClient):
     def from_env(cls, **kw: Any) -> AsyncKeeperHubClient:
         return cls(**kw)
 
-    async def list_workflows(self, *, limit: int = 50, offset: int = 0) -> list[Workflow]:
-        data = await self._request("GET", "/workflows",
-                                   params={"limit": limit, "offset": offset})
-        return _coerce(Workflow, data)
+    async def list_workflows(self) -> dict[str, Any]:
+        data = await self._request("GET", "/mcp/workflows")
+        if isinstance(data, list):
+            return {"items": data}
+        return data or {"items": []}
 
-    async def get_workflow(self, workflow_id: str) -> Workflow:
-        data = await self._request("GET", f"/workflows/{workflow_id}")
-        return _coerce(Workflow, data)
+    async def get_openapi(self) -> dict[str, Any]:
+        return await self._request("GET", "/openapi") or {}
 
-    async def execute_workflow(self, workflow_id: str,
-                               inputs: dict[str, Any] | None = None) -> WorkflowExecution:
-        data = await self._request("POST", f"/workflows/{workflow_id}/execute",
-                                   json={"input": inputs or {}})
-        return _coerce(WorkflowExecution, data)
+    async def call_workflow(
+        self,
+        slug: str,
+        body: dict[str, Any] | None = None,
+        *,
+        x_payment: str | None = None,
+    ) -> dict[str, Any]:
+        extra: dict[str, str] | None = None
+        if x_payment:
+            extra = {"X-Payment": x_payment}
+        return await self._request("POST", f"/mcp/workflows/{slug}/call",
+                                   json=body or {}, extra_headers=extra) or {}
 
-    async def get_execution_status(self, execution_id: str) -> WorkflowExecution:
-        data = await self._request("GET", f"/workflows/executions/{execution_id}/status")
-        return _coerce(WorkflowExecution, data)
+    async def list_org_workflows(self) -> list[dict[str, Any]]:
+        data = await self._request("GET", "/workflows") or []
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
+        return data or []
 
-    async def get_execution_logs(self, execution_id: str) -> list[ExecutionLogEntry]:
-        data = await self._request("GET", f"/workflows/executions/{execution_id}/logs")
-        return _coerce(ExecutionLogEntry, data)
-
-    async def wait_for_execution(self, execution_id: str, *, timeout: float = 120.0,
-                                 poll_interval: float = 2.0) -> WorkflowExecution:
-        deadline = anyio.current_time() + timeout
-        while True:
-            execution = await self.get_execution_status(execution_id)
-            if execution.status.value in ("success", "error", "failed",
-                                          "cancelled", "completed"):
-                return execution
-            if anyio.current_time() > deadline:
-                raise KeeperHubAPIError(
-                    f"Timed out waiting for execution {execution_id}; last status="
-                    f"{execution.status.value}"
-                )
-            await anyio.sleep(poll_interval)
+    async def list_integrations(self) -> list[dict[str, Any]]:
+        data = await self._request("GET", "/integrations") or []
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
+        return data or []
 
     async def close(self) -> None:
         await self._http.aclose()

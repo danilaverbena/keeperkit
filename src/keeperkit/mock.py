@@ -1,291 +1,261 @@
-"""In-memory mock backend that mimics the KeeperHub API.
+"""In-memory ``MockKeeperHubClient`` mirroring the real public API.
 
-Why this matters: KeeperHub auth is org-scoped, so getting a real key takes
-time at the start of a hackathon and you can't easily share one. The mock
-backend lets a builder integrate KeeperKit immediately, write tests against a
-deterministic surface, and then flip a single env var to hit the real API.
+The mock matches the surface of :class:`keeperkit.client.KeeperHubClient`
+exactly — same method names, same return shapes — so the rest of the
+codebase (tools, server, examples) doesn't care which one it talks to.
 
-The mock is *intentionally* not a perfect simulator — it covers the surface
-KeeperKit's tools depend on:
+The mock ships with a small **representative** catalogue derived from the
+real ``GET /api/mcp/workflows`` response (free + paid samples across the
+three workflow archetypes KeeperHub publishes today: read DeFi data, write
+onchain transactions, and a hello-world). It's enough to demo the full
+plugin surface — including 402 / x402 — without any external network
+calls.
 
-* workflow CRUD,
-* ``execute_workflow`` (returns a deterministic, completed execution),
-* ``execute_action`` (single-shot web3 actions: balance, transfer, write),
-* execution status + logs,
-* a default mock wallet integration.
+Tip: pass ``catalogue=`` to override the built-in fixture (e.g. to load a
+saved real-API snapshot from ``tests/fixtures/keeperhub_catalogue.json``).
 """
 
 from __future__ import annotations
 
+import secrets
 import time
-import uuid
 from typing import Any
 
-from keeperkit.exceptions import KeeperHubNotFoundError
-from keeperkit.models import (
-    Edge,
-    ExecutionLogEntry,
-    ExecutionStatus,
-    Node,
-    NodeStatus,
-    WalletIntegration,
-    Workflow,
-    WorkflowExecution,
+from keeperkit.exceptions import (
+    KeeperHubNotFoundError,
+    KeeperHubPaymentRequired,
 )
 
+# Representative subset of the real catalogue. Slugs, schemas, prices and
+# workflowType match what KeeperHub returns in production today (May 2026).
+DEFAULT_CATALOGUE: list[dict[str, Any]] = [
+    {
+        "id": "mock_helloworld",
+        "name": "HelloWorld",
+        "description": "Simple workflow that returns a Hello, World! message.",
+        "listedSlug": "helloworld",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "priceUsdcPerCall": None,
+        "workflowType": "read",
+        "category": "demo",
+        "chain": None,
+        "isListed": True,
+    },
+    {
+        "id": "mock_defi_position_aggregator_base",
+        "name": "DeFi Position Aggregator: Wallet on Base",
+        "description": (
+            "Aggregates a wallet's DeFi positions across the major lending and "
+            "yield venues KeeperHub supports on Base in a single call — Aave V3 "
+            "(with health factor), Compound V3 USDC, Morpho Steakhouse USDC."
+        ),
+        "listedSlug": "defi-position-aggregator-base",
+        "inputSchema": {
+            "type": "object",
+            "required": ["wallet"],
+            "properties": {
+                "wallet": {
+                    "type": "string",
+                    "description": "Wallet address (0x…) on Base.",
+                }
+            },
+            "additionalProperties": False,
+        },
+        "priceUsdcPerCall": None,
+        "workflowType": "read",
+        "category": "defi",
+        "chain": "8453",
+        "isListed": True,
+    },
+    {
+        "id": "mock_aave_v3_health_check",
+        "name": "Aave v3 Health Check",
+        "description": (
+            "Reads the Aave v3 health factor, total collateral, total debt, and "
+            "risk classification for a given wallet."
+        ),
+        "listedSlug": "aave-v3-health-check",
+        "inputSchema": {
+            "type": "object",
+            "required": ["address"],
+            "properties": {
+                "address": {"type": "string", "description": "EVM wallet address."}
+            },
+            "additionalProperties": False,
+        },
+        "priceUsdcPerCall": "0.01",
+        "workflowType": "read",
+        "category": "defi",
+        "chain": "1",
+        "isListed": True,
+    },
+    {
+        "id": "mock_microtip",
+        "name": "Microtip",
+        "description": (
+            "Send a small USDC tip from your KeeperHub wallet to any EVM address "
+            "with idempotency built in."
+        ),
+        "listedSlug": "microtip",
+        "inputSchema": {
+            "type": "object",
+            "required": ["recipient", "amount"],
+            "properties": {
+                "recipient": {"type": "string"},
+                "amount": {"type": "string", "description": "USDC amount, decimal string."},
+                "chain": {"type": "string", "default": "8453"},
+            },
+            "additionalProperties": False,
+        },
+        "priceUsdcPerCall": "0.01",
+        "workflowType": "write",
+        "category": "payments",
+        "chain": "8453",
+        "isListed": True,
+    },
+    {
+        "id": "mock_sepolia_balance_check",
+        "name": "Sepolia Balance Check",
+        "description": "Read the native ETH balance of an address on Sepolia.",
+        "listedSlug": "sepolia-balance-check",
+        "inputSchema": {
+            "type": "object",
+            "required": ["address"],
+            "properties": {
+                "address": {"type": "string", "description": "0x… EVM address."}
+            },
+            "additionalProperties": False,
+        },
+        "priceUsdcPerCall": None,
+        "workflowType": "read",
+        "category": "defi",
+        "chain": "11155111",
+        "isListed": True,
+    },
+]
 
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+def _exec_id() -> str:
+    return f"exec_{secrets.token_hex(6)}"
+
+
+def _x402_descriptor(slug: str, price_usdc: str) -> dict[str, Any]:
+    """Build the structured x402 descriptor we'd return on 402."""
+    return {
+        "x402Version": 2,
+        "error": "Payment required",
+        "resource": {
+            "url": f"https://app.keeperhub.com/api/mcp/workflows/{slug}/call",
+            "description": f"Pay to run workflow: {slug}",
+            "mimeType": "application/json",
+        },
+        "accepts": [
+            {
+                "scheme": "exact",
+                "network": "eip155:8453",
+                "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC on Base
+                "amount": str(int(float(price_usdc) * 1_000_000)),  # 6-decimal atomic
+                "payTo": "0x650a09bc1cda076486716acdd80fce1bba5e84ff",
+                "maxTimeoutSeconds": 300,
+                "extra": {"name": "USD Coin", "version": "2"},
+            }
+        ],
+    }
 
 
 class MockKeeperHubClient:
-    """Drop-in stand-in for :class:`KeeperHubClient`.
+    """In-memory KeeperHub client mirroring the real public API surface."""
 
-    The mock implements the same method names, so swapping ``KeeperHubClient``
-    for ``MockKeeperHubClient()`` in your code is enough to run end-to-end
-    against an in-memory backend.
-    """
+    def __init__(
+        self,
+        *,
+        catalogue: list[dict[str, Any]] | None = None,
+        accept_x_payment_token: str = "mock-token",
+    ) -> None:
+        self.base_url = "in-memory"
+        self.api_key = "mock"
+        self._catalogue = list(catalogue if catalogue is not None else DEFAULT_CATALOGUE)
+        self._accept_token = accept_x_payment_token
+        self._executions: dict[str, dict[str, Any]] = {}
 
-    is_mock = True
+    # ------------------------------------------------------------- discovery
+    def list_workflows(self) -> dict[str, Any]:
+        return {"items": list(self._catalogue)}
 
-    def __init__(self) -> None:
-        self._workflows: dict[str, Workflow] = {}
-        self._executions: dict[str, WorkflowExecution] = {}
-        self._logs: dict[str, list[ExecutionLogEntry]] = {}
-        # one default wallet so transfer/write actions don't need extra setup
-        self._wallet = WalletIntegration(
-            id="wallet_mock_main",
-            name="Mock KeeperHub Wallet",
-            network="11155111",
-            address="0xMockWallet0000000000000000000000000000000",
-        )
-
-    # ----------------------------------------------------------------- workflows
-    def list_workflows(self, *, limit: int = 50, offset: int = 0) -> list[Workflow]:
-        items = list(self._workflows.values())
-        return items[offset : offset + limit]
-
-    def get_workflow(self, workflow_id: str) -> Workflow:
-        if workflow_id not in self._workflows:
-            raise KeeperHubNotFoundError(f"workflow {workflow_id} not found")
-        return self._workflows[workflow_id]
-
-    def create_workflow(self, workflow: Workflow | dict[str, Any]) -> Workflow:
-        if isinstance(workflow, dict):
-            workflow = Workflow.model_validate(workflow)
-        wf = workflow.model_copy(update={"id": workflow.id or _new_id("wf")})
-        self._workflows[wf.id] = wf
-        return wf
-
-    def update_workflow(self, workflow_id: str, patch: dict[str, Any]) -> Workflow:
-        wf = self.get_workflow(workflow_id)
-        updated = wf.model_copy(update=patch)
-        self._workflows[workflow_id] = updated
-        return updated
-
-    def delete_workflow(self, workflow_id: str, *, force: bool = False) -> None:
-        if workflow_id not in self._workflows:
-            raise KeeperHubNotFoundError(f"workflow {workflow_id} not found")
-        del self._workflows[workflow_id]
-
-    # ----------------------------------------------------------------- execution
-    def execute_workflow(self, workflow_id: str,
-                         inputs: dict[str, Any] | None = None) -> WorkflowExecution:
-        wf = self.get_workflow(workflow_id)
-        return self._simulate_execution(wf, inputs or {})
-
-    def get_execution_status(self, execution_id: str) -> WorkflowExecution:
-        if execution_id not in self._executions:
-            raise KeeperHubNotFoundError(f"execution {execution_id} not found")
-        return self._executions[execution_id]
-
-    def get_execution_logs(self, execution_id: str) -> list[ExecutionLogEntry]:
-        if execution_id not in self._logs:
-            raise KeeperHubNotFoundError(f"execution {execution_id} not found")
-        return list(self._logs[execution_id])
-
-    def list_executions(self, workflow_id: str) -> list[WorkflowExecution]:
-        return [e for e in self._executions.values() if e.workflowId == workflow_id]
-
-    def wait_for_execution(self, execution_id: str, *, timeout: float = 120.0,
-                           poll_interval: float = 0.0) -> WorkflowExecution:
-        # Mock executions are synchronous, so we can just return the stored one.
-        return self.get_execution_status(execution_id)
-
-    # ------------------------------------------------------- single-shot actions
-    def execute_action(self, action_type: str, config: dict[str, Any], *,
-                       network: str | None = None) -> WorkflowExecution:
-        cfg = dict(config)
-        if network is not None:
-            cfg.setdefault("network", network)
-        wf = Workflow(
-            name=f"adhoc:{action_type}",
-            nodes=[
-                Node(
-                    id="trigger-1", type="trigger",
-                    data={"label": "Manual", "type": "trigger",
-                          "config": {"triggerType": "Manual"}},
-                ),
-                Node(
-                    id="action-1", type="action",
-                    data={"label": action_type, "type": "action",
-                          "config": cfg | {"actionType": action_type}},
-                ),
-            ],
-            edges=[Edge(id="e1", source="trigger-1", target="action-1")],
-        )
-        return self._simulate_execution(wf, cfg)
-
-    def check_balance(self, network: str, address: str) -> dict[str, Any]:
-        execution = self.execute_action(
-            "web3/check-balance",
-            {"network": network, "address": address},
-        )
-        return (execution.output or {}) | {"executionId": execution.id}
-
-    def transfer_funds(self, network: str, to_address: str, amount: str,
-                       wallet_id: str) -> WorkflowExecution:
-        return self.execute_action(
-            "web3/transfer-funds",
-            {"network": network, "toAddress": to_address,
-             "amount": amount, "walletId": wallet_id},
-        )
-
-    def write_contract(self, network: str, contract_address: str, function_name: str,
-                       wallet_id: str, args: list[Any] | None = None,
-                       value: str | None = None) -> WorkflowExecution:
-        cfg: dict[str, Any] = {
-            "network": network,
-            "contractAddress": contract_address,
-            "functionName": function_name,
-            "walletId": wallet_id,
-        }
-        if args is not None:
-            cfg["args"] = args
-        if value is not None:
-            cfg["value"] = value
-        return self.execute_action("web3/write-contract", cfg)
-
-    # --------------------------------------------------------------- integrations
-    def list_integrations(self, *, type: str | None = None) -> list[dict[str, Any]]:
-        return [self._wallet.model_dump()]
-
-    def get_wallet_integration(self) -> WalletIntegration:
-        return self._wallet
-
-    def list_action_schemas(self, *, category: str | None = None) -> list[dict[str, Any]]:
-        # A representative subset of KeeperHub's web3 action schemas, kept
-        # compact so the demo agent can list them without overwhelming the LLM.
-        all_schemas = [
-            {
-                "actionType": "web3/check-balance",
-                "category": "web3",
-                "description": "Read native token balance for an address.",
-                "fields": ["network", "address"],
+    def get_openapi(self) -> dict[str, Any]:
+        return {
+            "openapi": "3.1.0",
+            "info": {
+                "title": "KeeperHub (mock)",
+                "version": "0.1.0",
+                "description": "Mock KeeperHub OpenAPI for offline demos.",
             },
-            {
-                "actionType": "web3/check-token-balance",
-                "category": "web3",
-                "description": "Read ERC-20 token balance.",
-                "fields": ["network", "address", "tokenAddress"],
-            },
-            {
-                "actionType": "web3/transfer-funds",
-                "category": "web3",
-                "description": "Send native token (with retry + gas opt + private routing).",
-                "fields": ["network", "toAddress", "amount", "walletId"],
-            },
-            {
-                "actionType": "web3/transfer-token",
-                "category": "web3",
-                "description": "Send ERC-20 token.",
-                "fields": ["network", "toAddress", "tokenAddress", "amount", "walletId"],
-            },
-            {
-                "actionType": "web3/write-contract",
-                "category": "web3",
-                "description": "Call a state-changing contract function.",
-                "fields": ["network", "contractAddress", "functionName", "walletId",
-                           "args"],
-            },
-            {
-                "actionType": "web3/read-contract",
-                "category": "web3",
-                "description": "Read from a view/pure contract function.",
-                "fields": ["network", "contractAddress", "functionName", "args"],
-            },
-        ]
-        if category:
-            return [s for s in all_schemas if s["category"] == category]
-        return all_schemas
-
-    def ai_generate_workflow(self, description: str, *,
-                             modify_workflow_id: str | None = None) -> Workflow:
-        # The mock can't actually call an LLM, but it can produce a sensible
-        # single-action workflow so downstream code paths still exercise.
-        wf = Workflow(
-            name=f"AI: {description[:50]}",
-            description=description,
-            nodes=[
-                Node(
-                    id="trigger-1", type="trigger",
-                    data={"label": "Manual", "type": "trigger",
-                          "config": {"triggerType": "Manual"}},
-                ),
-                Node(
-                    id="action-1", type="action",
-                    data={
-                        "label": "Check Balance",
-                        "type": "action",
-                        "config": {
-                            "actionType": "web3/check-balance",
-                            "network": "11155111",
-                            "address": "0x0000000000000000000000000000000000000000",
+            "paths": {
+                f"/api/mcp/workflows/{wf['listedSlug']}/call": {
+                    "post": {
+                        "operationId": f"call-{wf['listedSlug']}",
+                        "summary": wf["name"],
+                        "description": wf.get("description", ""),
+                        "requestBody": {
+                            "content": {"application/json": {"schema": wf["inputSchema"]}}
                         },
-                    },
-                ),
-            ],
-            edges=[Edge(id="e1", source="trigger-1", target="action-1")],
-        )
-        return self.create_workflow(wf)
+                    }
+                }
+                for wf in self._catalogue
+                if wf.get("listedSlug")
+            },
+        }
 
-    # ------------------------------------------------------- internal simulation
-    def _simulate_execution(self, wf: Workflow,
-                            inputs: dict[str, Any]) -> WorkflowExecution:
-        execution_id = _new_id("exec")
-        action_logs: list[ExecutionLogEntry] = []
-        output: dict[str, Any] = {}
-        for node in wf.nodes:
-            if node.type != "action":
-                continue
-            action = node.data.config.get("actionType", "")
-            simulated = _simulate_action(action, node.data.config, inputs)
-            output = simulated
-            action_logs.append(
-                ExecutionLogEntry(
-                    nodeId=node.id,
-                    nodeName=node.data.label,
-                    nodeType=node.type,
-                    status=NodeStatus.SUCCESS,
-                    input=node.data.config,
-                    output=simulated,
-                    duration=42,
-                    createdAt=_now(),
-                )
+    # ------------------------------------------------------------- execution
+    def call_workflow(
+        self,
+        slug: str,
+        body: dict[str, Any] | None = None,
+        *,
+        x_payment: str | None = None,
+    ) -> dict[str, Any]:
+        wf = next((w for w in self._catalogue if w.get("listedSlug") == slug), None)
+        if wf is None:
+            raise KeeperHubNotFoundError(
+                f"workflow {slug!r} not in mock catalogue", status_code=404
             )
-        execution = WorkflowExecution(
-            id=execution_id,
-            workflowId=wf.id,
-            status=ExecutionStatus.SUCCESS,
-            input=inputs,
-            output=output,
-            createdAt=_now(),
-            completedAt=_now(),
-        )
-        self._executions[execution_id] = execution
-        self._logs[execution_id] = action_logs
-        return execution
 
+        price = wf.get("priceUsdcPerCall")
+        if price and x_payment != self._accept_token:
+            raise KeeperHubPaymentRequired(
+                f"workflow {slug!r} requires payment ({price} USDC).",
+                x402=_x402_descriptor(slug, price),
+            )
+
+        execution_id = _exec_id()
+        result = _simulate_output(slug, body or {})
+        record = {
+            "executionId": execution_id,
+            "status": "success",
+            "output": {"logs": [], "result": result, "success": True},
+            "_slug": slug,
+            "_calledAt": time.time(),
+        }
+        self._executions[execution_id] = record
+        return {k: v for k, v in record.items() if not k.startswith("_")}
+
+    # ----------------------------------------------------- builder-side helpers
+    def list_org_workflows(self) -> list[dict[str, Any]]:
+        # In mock land the org "owns" the same listed catalogue.
+        return [dict(w) for w in self._catalogue]
+
+    def list_integrations(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "mock_wallet_base",
+                "type": "web3",
+                "chain": "8453",
+                "name": "Mock Base wallet",
+                "address": "0x000000000000000000000000000000000000dEaD",
+            }
+        ]
+
+    # ------------------------------------------------------------- housekeeping
     def close(self) -> None:
         pass
 
@@ -296,53 +266,50 @@ class MockKeeperHubClient:
         self.close()
 
 
-def _now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def _simulate_output(slug: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Return a plausible output payload per workflow type."""
+    if slug == "helloworld":
+        return {"message": "Hello World!"}
 
+    if slug == "defi-position-aggregator-base":
+        return {
+            "wallet": body.get("wallet"),
+            "totalUsd": "1234.56",
+            "positions": [
+                {"protocol": "aave-v3", "asset": "USDC", "balance": "1000.00",
+                 "apy": "5.41"},
+                {"protocol": "morpho", "asset": "USDC", "balance": "234.56",
+                 "apy": "4.82"},
+            ],
+        }
 
-def _simulate_action(action: str, config: dict[str, Any],
-                     inputs: dict[str, Any]) -> dict[str, Any]:
-    """Return a plausible action output without touching a real chain."""
-    if action == "web3/check-balance":
+    if slug == "aave-v3-health-check":
         return {
-            "balance": "0.1234",
-            "balanceWei": "123400000000000000",
-            "address": config.get("address"),
-            "network": config.get("network"),
+            "address": body.get("address"),
+            "healthFactor": "2.13",
+            "totalCollateralUSD": "12345.00",
+            "totalDebtUSD": "5800.00",
+            "riskLevel": "healthy",
         }
-    if action == "web3/check-token-balance":
+
+    if slug == "microtip":
         return {
-            "balance": "1000.0",
-            "tokenAddress": config.get("tokenAddress"),
-            "address": config.get("address"),
-            "network": config.get("network"),
+            "recipient": body.get("recipient"),
+            "amount": body.get("amount"),
+            "chain": body.get("chain", "8453"),
+            "txHash": f"0x{secrets.token_hex(32)}",
+            "transactionLink": (
+                "https://basescan.org/tx/"
+                f"0x{secrets.token_hex(32)}"
+            ),
         }
-    if action in ("web3/transfer-funds", "web3/transfer-token"):
+
+    if slug == "sepolia-balance-check":
         return {
-            "txHash": f"0x{uuid.uuid4().hex}{uuid.uuid4().hex}",
-            "from": "0xMockWallet0000000000000000000000000000000",
-            "to": config.get("toAddress"),
-            "amount": config.get("amount"),
-            "network": config.get("network"),
-            "status": "confirmed",
-            "retries": 0,
-            "gasUsed": "21000",
-            "private": True,
-            "transactionLink": "https://sepolia.etherscan.io/tx/0xMOCK",
+            "address": body.get("address"),
+            "chainId": "11155111",
+            "balanceWei": "12345678901234567890",
+            "balanceEth": "12.345",
         }
-    if action == "web3/write-contract":
-        return {
-            "txHash": f"0x{uuid.uuid4().hex}{uuid.uuid4().hex}",
-            "contractAddress": config.get("contractAddress"),
-            "functionName": config.get("functionName"),
-            "args": config.get("args"),
-            "network": config.get("network"),
-            "status": "confirmed",
-        }
-    if action == "web3/read-contract":
-        return {
-            "value": "42",
-            "functionName": config.get("functionName"),
-            "contractAddress": config.get("contractAddress"),
-        }
-    return {"action": action, "config": config, "inputs": inputs, "ok": True}
+
+    return {"slug": slug, "input": body, "note": "mock simulated output"}

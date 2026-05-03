@@ -33,8 +33,8 @@ def main() -> None:
     agent = create_react_agent(llm, tools)
 
     prompt = (
-        "Check the native balance of 0x9c8f005ab27adb94f3d49020a15722db2fcd9f27 "
-        "on Sepolia and report it."
+        "List the KeeperHub workflow catalogue, then call helloworld as a "
+        "smoke test and report what KeeperHub returned."
     )
     response = agent.invoke({"messages": [("user", prompt)]})
     for msg in response["messages"]:

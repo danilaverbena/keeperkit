@@ -1,40 +1,84 @@
+"""Tests for the framework-agnostic ToolSpec catalogue."""
+
+from __future__ import annotations
+
 from keeperkit import MockKeeperHubClient
-from keeperkit.tools._common import KEEPERHUB_TOOL_SPECS, default_dispatch, find_spec
+from keeperkit.tools._common import (
+    STATIC_TOOL_SPECS,
+    build_all_tool_specs,
+    build_workflow_tools,
+    safe_dispatch,
+)
 
 
-def test_every_spec_dispatches_against_mock():
+def test_static_tools_have_unique_names_and_schemas():
+    names = [s.name for s in STATIC_TOOL_SPECS]
+    assert len(names) == len(set(names))
+    for s in STATIC_TOOL_SPECS:
+        assert s.parameters.get("type") == "object"
+        assert s.metadata.get("static") is True
+
+
+def test_workflow_tools_generated_from_catalogue():
     client = MockKeeperHubClient()
-    # The mock has no created workflows, so calls expecting an id should not
-    # be dispatched here. We just smoke-test the read-only / no-arg ones.
-    for spec in KEEPERHUB_TOOL_SPECS:
-        if spec.dispatch_key in ("get_workflow", "execute_workflow",
-                                  "get_execution_status", "get_execution_logs"):
-            continue
-        if spec.dispatch_key in ("transfer_funds", "write_contract"):
-            args = {"network": "11155111",
-                    "to_address": "0x0000000000000000000000000000000000000001",
-                    "amount": "0.001",
-                    "wallet_id": "wallet_mock_main"}
-            if spec.dispatch_key == "write_contract":
-                args = {"network": "11155111",
-                        "contract_address": "0xcafe000000000000000000000000000000000000",
-                        "function_name": "transfer",
-                        "wallet_id": "wallet_mock_main",
-                        "args": ["0x0000000000000000000000000000000000000001", "1"]}
-            result = default_dispatch(client, spec, **args)
-        elif spec.dispatch_key == "check_balance":
-            result = default_dispatch(
-                client, spec,
-                network="11155111",
-                address="0x0000000000000000000000000000000000000001",
-            )
-        elif spec.dispatch_key == "ai_generate_workflow":
-            result = default_dispatch(client, spec, description="test")
-        else:
-            result = default_dispatch(client, spec)
-        assert result["ok"] is True
+    wf_specs = build_workflow_tools(client)
+    expected_slugs = {wf["listedSlug"] for wf in client.list_workflows()["items"]
+                      if wf.get("listedSlug")}
+    actual_slugs = {s.metadata["slug"] for s in wf_specs}
+    assert actual_slugs == expected_slugs
+    # Names are namespaced with `keeperhub_`.
+    for s in wf_specs:
+        assert s.name.startswith("keeperhub_")
+        assert s.metadata.get("static") is False
 
 
-def test_find_spec_roundtrip():
-    spec = find_spec("keeperhub_check_balance")
-    assert spec.dispatch_key == "check_balance"
+def test_build_all_combines_static_and_workflow():
+    client = MockKeeperHubClient()
+    all_specs = build_all_tool_specs(client)
+    static_names = {s.name for s in STATIC_TOOL_SPECS}
+    assert static_names <= {s.name for s in all_specs}
+    assert len(all_specs) == len(STATIC_TOOL_SPECS) + len(build_workflow_tools(client))
+
+
+def test_safe_dispatch_handles_payment_required():
+    client = MockKeeperHubClient()
+    specs = build_workflow_tools(client)
+    aave_spec = next(s for s in specs if s.metadata["slug"] == "aave-v3-health-check")
+    res = safe_dispatch(aave_spec, client,
+                        address="0x000000000000000000000000000000000000dEaD")
+    assert res["ok"] is False
+    assert res["error"] == "payment_required"
+    assert res["x402"]["x402Version"] == 2
+    assert res["amount_usdc"]
+
+
+def test_safe_dispatch_unwraps_success():
+    client = MockKeeperHubClient()
+    specs = build_workflow_tools(client)
+    hello = next(s for s in specs if s.metadata["slug"] == "helloworld")
+    res = safe_dispatch(hello, client)
+    assert res["ok"] is True
+    assert res["data"]["status"] == "success"
+
+
+def test_safe_dispatch_static_list_workflows():
+    client = MockKeeperHubClient()
+    list_spec = next(s for s in STATIC_TOOL_SPECS
+                     if s.name == "keeperhub_list_workflows")
+    res = safe_dispatch(list_spec, client)
+    assert res["ok"] is True
+    assert res["data"]["items"]
+
+
+def test_safe_dispatch_static_call_workflow_with_payment():
+    client = MockKeeperHubClient()
+    call_spec = next(s for s in STATIC_TOOL_SPECS
+                     if s.name == "keeperhub_call_workflow")
+    res = safe_dispatch(
+        call_spec, client,
+        slug="aave-v3-health-check",
+        body={"address": "0x000000000000000000000000000000000000dEaD"},
+        x_payment="mock-token",
+    )
+    assert res["ok"] is True
+    assert res["data"]["output"]["result"]["healthFactor"] == "2.13"

@@ -1,240 +1,275 @@
-# KeeperHub Builder Feedback
+# KeeperKit ↔ KeeperHub — Builder Feedback
 
-> Submitted as part of the [ETHGlobal OpenAgents](https://ethglobal.com/events/openagents) hackathon for the KeeperHub *Builder Feedback Bounty*. Project: [`danilaverbena/keeperkit`](https://github.com/danilaverbena/keeperkit).
+> Submitted to the **KeeperHub Builder Feedback Bounty** (ETHGlobal
+> OpenAgents). Author: KeeperKit team. Built against the KeeperHub public
+> API at `https://app.keeperhub.com/api`, organisation API key
+> (`kh_…`), May 2026. Findings come from a real end-to-end integration
+> shipped at <https://github.com/danilaverbena/keeperkit> and live on
+> <http://178.104.45.97:8420>.
 
-This document captures what worked well, what tripped us up, and what we'd
-ask for next when integrating KeeperHub from a Python AI-agent codebase.
-Each item is concrete, reproducible, and actionable — written in the order
-we hit them.
-
----
-
-## TL;DR — five-line summary
-
-1. **The MCP server, REST API, and CLI are well-aligned.** Naming/shape stays
-   consistent across all three, which made the SDK trivial to design.
-2. **The action catalogue is the killer feature.** `web3/transfer-funds`
-   doing retry + gas-opt + private routing in one call is the right
-   abstraction for AI agents.
-3. **The biggest friction is org-only API keys** — there's no way to do a
-   "hello world" without a 5-minute org-level setup. We had to ship a
-   mock client to make hackathon DX bearable.
-4. **Auth scoping needs more granularity.** A read-only scope (workflows +
-   executions, no write) would let frameworks safely embed the API key in
-   client-side / public agent flows.
-5. **Docs are clean but missing one thing: a one-page “quickstart for
-   programmatic builders.”** Most current docs assume someone clicking
-   through the dashboard.
+This file is intentionally specific. Each item is something we hit while
+shipping, with a screenshot-worthy reproducer where possible, and a
+concrete suggestion. We hope it's useful — KeeperHub is genuinely the
+nicest "execution layer for agents" we've integrated against this
+hackathon, so this is feedback in the spirit of "we want to ship more
+on it".
 
 ---
 
-## What worked extremely well
+## TL;DR for KeeperHub PMs
 
-### 1. The action catalogue is shaped exactly right for AI agents.
-`web3/transfer-funds`, `web3/write-contract`, and `web3/check-balance` are
-*the* primitives an LLM-driven agent wants to call. The fact that
-KeeperHub already wraps retry, gas escalation, simulation, and private
-MEV-aware routing under those names meant our LangChain ReAct agent didn't
-need any custom defensive code — it just calls the tool and gets a
-finalized `txHash`. That's a much better fit than hand-rolled `eth_send`
-+ retry loops we've seen in other agent stacks.
+* **Marketing pages and the public REST surface drift.** The marketing
+  copy describes a CRUD-style execution platform (`POST /api/execute`,
+  workflow CRUD over REST), but the real public API is a **catalogue of
+  callable workflows** under `/api/mcp/workflows/{slug}/call` with x402
+  billing. We rebuilt our SDK once when we discovered this. A 1-page
+  "API at a glance" doc would have saved us ~1 hour.
+* **The 402 flow is great, but the failure mode is silent.** When a
+  paid workflow gets called without `X-Payment`, we get HTTP 402 with a
+  base64-encoded descriptor in `x-payment-requirements`. There is no
+  human-readable JSON in the body for non-MCP clients. We had to base64-
+  decode and inspect the header before our agent could reason about it.
+  Adding `Content-Type: application/json` with the same descriptor in the
+  body would let plain HTTP clients render a useful error without the
+  base64 step.
+* **`inputSchema` quality varies a lot across workflows.** Some are crisp
+  JSON Schema; others have `additionalProperties: false` but no
+  `required`, or use plain English in `description` for things that
+  should be enums. Tightening these would let LLMs auto-fill arguments
+  more reliably.
+* **No way to discover supported chains for a write workflow before
+  calling it.** We can call `keeperhub_list_workflows` and see
+  `category` / `chain` for some entries but the field is inconsistent.
+* **The `kh_…` key works for both the MCP server and the REST API**,
+  which is great. But the docs we found never said this out loud — we
+  guessed and tried.
 
-### 2. Three execution surfaces, one mental model.
-The fact that the hosted MCP, the REST API, and the CLI all share the
-same nouns (workflow, node, edge, execution, log) is rare. We were able
-to define our 12-tool catalogue once in
-[`tools/_common.py`](src/keeperkit/tools/_common.py) and reuse it from
-LangChain, CrewAI, and ElizaOS without diverging.
-
-### 3. Workflow execution responses are agent-friendly.
-The execution envelope (`status`, `output`, per-node logs, `transactionLink`)
-maps cleanly to what an LLM needs to "report back" to the user. Several
-similar platforms force you to poll three different endpoints to assemble
-that. KeeperHub's `/executions/{id}/status` + `/executions/{id}/logs`
-is a one-pair fetch.
-
-### 4. AI workflow generation is genuinely useful.
-The `ai-generate-workflow` endpoint is more than a marketing demo — for a
-hackathon team, "describe what you want and get a workflow stub" is a
-real productivity win. We exposed it as a top-level tool
-(`keeperhub_ai_generate_workflow`) and the agent uses it in our
-"generate a Discord-on-balance-drop workflow" demo.
-
-### 5. The MCP server is hosted (no local Node bridge).
-We considered shipping a local MCP wrapper for ElizaOS but
-`https://app.keeperhub.com/mcp` removed that need entirely. That's the
-right default — every other MCP server we touch this hackathon needs a
-local process.
+The rest of this doc walks through specific friction points and feature
+requests with reproducers.
 
 ---
 
-## Friction points (ranked by hours-lost)
+## 1 · Friction points hit while integrating
 
-### F1 · Org-only API keys block the first 30 minutes of any integration.
-*Problem.* The org API key model means a builder evaluating KeeperHub
-(or a hackathon team starting from zero) has to:
-- create an account,
-- create or join an org,
-- find the right tab (Settings → API Keys → **Organisation**),
-- create the key,
-- copy it, paste it in env.
+### 1.1 Marketing surface ≠ public API surface
 
-By the time we'd done that, our LangChain demo was already running against
-our own mock backend. Several teams we talked to gave up at step 3
-because they thought a personal API key would work.
+* **Where**: <https://keeperhub.com> landing page + docs.
+* **What we expected (from marketing)**:
+  - `POST /api/workflows` → create a workflow programmatically
+  - `POST /api/execute` → run an arbitrary action (transfer, contract write)
+  - `GET /api/action-schemas` → discover available actions
+* **What's actually there (from `GET /api/openapi`)**:
+  - `GET /api/mcp/workflows` → list a curated **catalogue** of callable workflows
+  - `POST /api/mcp/workflows/{slug}/call` → invoke a specific catalogued workflow
+  - `GET /api/workflows` → org-scoped workflow list (different shape!)
+  - `GET /api/integrations` → wallet integrations
+  - No `POST /api/execute`, no `POST /api/workflows`, no `/api/action-schemas` (returns 404).
+* **Impact**: We shipped an SDK against the marketing-implied API, then
+  rebuilt it after seeing the real OpenAPI. ~1 hour of rework + a fully
+  rewritten test suite.
+* **Suggestion**: Either (a) align marketing to "catalogue of callable
+  workflows" framing or (b) ship a minimal public CRUD that matches the
+  marketing claims. We strongly prefer (a) — the catalogue model is
+  cleaner and more agent-friendly. A single "for builders, your API is
+  this" page on the marketing site (linking to `/api/openapi`) would
+  have made this obvious.
 
-*Suggested fix.*
-- Issue a short-lived **builder/sandbox key** automatically when an
-  account is created. Even a 24-hour key with a tiny request quota would
-  let people sketch in code instantly.
-- Or: a `kh login` CLI that drops a sandbox key into `~/.config/kh/credentials`
-  with no clicks.
-- Restate clearly in the docs that **personal API keys won't work for
-  workflow execution** — we wasted ~10 min trying one.
+### 1.2 x402 payment descriptor lives only in a header
 
-### F2 · No public sandbox / testnet wallet.
-*Problem.* To exercise `web3/transfer-funds` end-to-end you need a wallet
-integration *and* funds *and* a chain (Sepolia is fine, but you need
-SepETH). For demos, hackathon teams want a "demo wallet" they can call
-from. Today there's no such thing — you must wire up your own MPC wallet
-or KMS first.
+When you call a paid workflow without `X-Payment`:
 
-*Suggested fix.* A shared `wallet_demo_sepolia` integration with
-auto-refilled SepETH and a 0.001 ETH per-call cap, gated on org keys. We
-could not include a real-chain demo on our public site without this.
-Right now our hosted demo flips to mock for transfer flows.
+```
+HTTP/1.1 402 Payment Required
+www-authenticate: Payment id="…", x-payment="<descriptor base64>"
+x-payment-requirements: <descriptor base64>
+content-type: application/json
+content-length: 2
 
-### F3 · Auth scoping is binary.
-*Problem.* Today the org API key can do everything. For a public-facing
-agent (think: Discord bot, Telegram bot, hackathon judges' demo URL),
-embedding a full-permission key on a server is a non-starter. We had to
-guard our demo's transfer/write-contract endpoints behind a "force mock"
-checkbox to avoid that.
+{}
+```
 
-*Suggested fix.* Three scopes would solve this:
-- `read` — workflows, executions, logs, integrations metadata,
-- `execute:read-only` — adds `web3/check-balance` & `web3/read-contract`,
-- `execute:full` — current default.
+* **Friction**: A naive HTTP client logging the response body sees `{}`
+  and thinks "empty server error". You have to know to look at the
+  `x-payment-requirements` header, base64-decode it, and parse JSON.
+* **Suggestion**: Mirror the descriptor into the JSON body too. Most
+  agent frameworks log bodies, not headers. KeeperKit handles this in
+  `_decode_x402_header`, but every other integrator will also have to
+  write that code.
 
-### F4 · Action schemas don't surface JSON Schema.
-*Problem.* `GET /api/action-schemas` returns an array of objects but they
-aren't full JSON Schemas — fields are name + a free-text description.
-For an LLM tool catalogue we need something tighter (param types, enums,
-required flags). We ended up writing JSON Schema in
-[`tools/_common.py`](src/keeperkit/tools/_common.py) by hand.
+### 1.3 No `id` / `slug` distinction in catalogue listing
 
-*Suggested fix.* Add a `schema` key on each action with a real JSON Schema
-fragment so SDKs (and AI agents) can introspect parameters without
-guessing. Bonus: include sample inputs.
+Workflows have both an `id` (`5667q8uw1rq4y723t548n`) and a `listedSlug`
+(`defi-position-aggregator-ethereum`). Calling endpoints uses the slug,
+but lots of fields in the catalogue refer to the id. A note like "you
+will only ever pass `listedSlug` to `/call`; `id` is internal" would
+save a confused first request.
 
-### F5 · Execution status enum has multiple synonyms.
-*Problem.* In testing the status field returned `success`, `completed`,
-and (rarely) `failed` interchangeably. Our code now treats five strings
-as terminal states (see
-[`client.wait_for_execution`](src/keeperkit/client.py)). It works, but
-the API would be cleaner with one canonical set.
+### 1.4 `inputSchema` is sometimes too loose for an LLM
 
-*Suggested fix.* Document the enum precisely and pick one terminal
-success value. (We assume `success` is canonical and `completed` is a
-legacy alias.)
+Examples we hit:
+* `{"type": "object", "properties": {}, "additionalProperties": false}` —
+  fine, agent calls with `{}`.
+* `{"type": "object", "required": ["wallet"], "properties": {"wallet": {"type": "string", "description": "Wallet address (0x...) to aggregate DeFi positions for. Must be a valid Ethereum-compatible EVM address."}}}` —
+  great, the description is enough for the LLM to fill in a checksummed
+  address.
+* But several `write` workflows have schemas like
+  `{"type": "object"}` with no `required` / `properties` — the LLM can't
+  guess. We had to special-case these with prompt-time docs.
+* **Suggestion**: A schema-quality lint inside the KeeperHub Studio
+  before publishing a workflow. Even just "your inputSchema has no
+  `description` on top-level properties" as a warning would help.
 
-### F6 · Webhook trigger setup is dashboard-only.
-*Problem.* `WebhookTrigger` workflows can be CREATED via API, but the
-URL+secret pair isn't returned in the API response — you need to open the
-dashboard to copy the webhook URL. That breaks fully-programmatic flows.
+### 1.5 Discoverability of chain support per workflow
 
-*Suggested fix.* Return `{"webhookUrl": "...", "secret": "..."}` on
-workflow creation when a webhook trigger is present. Or expose
-`POST /api/workflows/{id}/regenerate-webhook`.
+For write workflows we couldn't reliably tell from the catalogue which
+chain they target without reading the workflow body. The existing
+`workflowType` field is good (`read` / `write`); please add a
+top-level `chain` (or `chains: [...]`) field to every catalogue entry.
 
-### F7 · CLI install path doesn't match docs in some shells.
-*Problem.* `go install github.com/keeperhub/cli/cmd/kh@latest` works on a
-clean macOS but on Linux Devin VMs we needed to ensure `$GOPATH/bin` was
-on `$PATH`. The Homebrew tap was the cleanest path, but the docs page
-buries it under the Go install.
+### 1.6 Listing endpoint pagination
 
-*Suggested fix.* Lead with `brew install keeperhub/tap/kh`. Or ship a
-one-liner: `curl -s https://app.keeperhub.com/install.sh | sh`.
+`GET /api/mcp/workflows` returns the full catalogue in one shot today.
+For a few-dozen-workflow catalogue this is fine, but at 200+ workflows
+it'll start to be expensive. Adding `?limit=&cursor=` (cursor pagination
+is much friendlier for agents than offset) would future-proof this.
 
-### F8 · No first-class Python SDK / examples.
-*Problem.* We found TypeScript and CLI examples but no Python ones — the
-implicit story was "use the REST API directly." For an AI builder
-audience that lives in Python (LangChain, CrewAI, LlamaIndex, etc.), this
-is a missing rung in the funnel. KeeperKit is in part our stop-gap fix.
+### 1.7 No "describe schema for slug X" lightweight endpoint
 
-*Suggested fix.* Either bless KeeperKit as a community SDK or publish an
-official `keeperhub` PyPI package with the same surface (workflow CRUD,
-execution + status + logs, single-action shortcuts). Either way: at least
-one Python quickstart in the docs index.
+If we already know the slug (e.g. agent learned it from a prior list
+call) and just want the input schema, we currently have to fetch the
+**entire** OpenAPI spec or list the **entire** catalogue. A
+`GET /api/mcp/workflows/{slug}/schema` (just the inputSchema JSON) would
+let us hot-reload tool definitions cheaply.
 
----
+### 1.8 Local development needs a mock or sandbox
 
-## Smaller papercuts
-
-* **Field naming inconsistency** — the API mixes `toAddress` with
-  `to_address`-style snake_case in some examples. We picked `toAddress`
-  since that's what the live API returns.
-* **Empty 200 responses on DELETE** — mostly fine, but a single
-  `DELETE /workflows/{id}?force=true` returned `204` while the docs said
-  `200`. Not a blocker, just noise.
-* **Rate-limit headers** — we'd love a `X-RateLimit-Remaining` to drive
-  agent backoff intelligently, instead of relying on retry-after-429.
-* **OpenAPI / Swagger** — the dashboard's `/api/docs` is great, but a
-  downloadable `openapi.json` would let us auto-generate clients in 4
-  more languages over a weekend.
-* **`ai-generate-workflow` cold start** — first call took ~14 s; later
-  calls ~3 s. A note in the docs would set expectations.
-* **Workflow JSON evolution** — the response sometimes contains a
-  `version` field, sometimes doesn't. We default it to `1` in our model
-  but the inconsistency tripped a Pydantic strict validator briefly.
+We built `MockKeeperHubClient` ourselves so we could run tests offline,
+but a first-party "sandbox" that mirrors the catalogue and returns
+plausible synthetic outputs would be much more useful — particularly
+for paid workflows where you don't want to burn USDC on a CI test run.
+Even a `?dryRun=true` query parameter that returns the canned `output`
+shape from the OpenAPI spec would be transformative for builders.
 
 ---
 
-## What we wish existed
+## 2 · Feature requests
 
-1. **Python SDK** with the exact same shape as KeeperKit. (Happy to donate
-   the design.)
-2. **Streaming execution events** via SSE or WebSocket on
-   `/api/workflows/executions/{id}/stream`. Polling 2 s is fine for demos
-   but agents want realtime.
-3. **Per-tool permission scopes** for the API key (see F3).
-4. **First-class agent framework story** — a one-page "AI agent builders
-   start here" with the LangChain example we built.
-5. **A "trial" workflow template gallery** — discoverable from the docs,
-   one-click clone into your org. Helps newcomers get a ready-to-modify
-   workflow without the empty-canvas problem.
-6. **A `kh diff` and `kh apply`** CLI pair for declaring workflows in
-   YAML/JSON files in a repo, then syncing them to KeeperHub. Today
-   workflows are dashboard-edited, which is hard to review.
+### 2.1 Per-workflow auth scoping
+
+Right now an organisation API key can call **any** workflow in the org.
+For multi-agent systems you sometimes want "this agent can only call
+read-only workflows" or "this agent can only call workflows under the
+`/payments/*` namespace". Scoped keys (e.g. `kh_workflow_<slug>_…`) or a
+`Subset` policy parameter on key creation would let us hand a key to a
+sub-agent without giving it the keys to the kingdom.
+
+### 2.2 Streaming execution updates
+
+`POST /call` returns a final `{executionId, status, output}` payload. For
+long-running workflows (multi-tx batches) it would be useful to either
+stream Server-Sent Events from the same endpoint or expose a
+`GET /api/mcp/workflows/{slug}/executions/{id}/events`. Otherwise we
+have to poll, and the poll endpoint isn't documented.
+
+### 2.3 First-class x402 retry helper
+
+x402 settlement clients (agentcash, openclaw, custom signers) all need
+the same dance: receive 402, decode descriptor, settle on-chain, retry
+with `X-Payment`. KeeperHub could ship a tiny helper SDK
+(`keeperhub-x402-py` / `keeperhub-x402-ts`) that wraps the retry. Today
+every integrator implements this loop themselves.
+
+### 2.4 OpenAPI spec includes pricing fields per workflow
+
+The catalogue listing has `priceUsdcPerCall`, but the OpenAPI spec for
+each `POST /call` endpoint doesn't include this in the spec metadata.
+Adding `x-price-usdc` (or even just embedding it into the description)
+would let LLMs reason about cost before calling.
+
+### 2.5 ElizaOS / LangChain / CrewAI plugin templates from KeeperHub itself
+
+The reason KeeperKit exists is that there was no first-party adapter for
+these frameworks. We're happy to keep KeeperKit alive, but a "downstream
+SDK" badge on the marketing site or a quickstart link from the docs
+would help builders find it (or build their own).
+
+### 2.6 Webhook on workflow publish
+
+So we can rebuild our agent's tool catalogue automatically when a new
+workflow is published. Today `POST /api/tools/_refresh` on our demo
+server has to be triggered manually.
 
 ---
 
-## What we built on top — for context
+## 3 · What worked really well
 
-KeeperKit ([repo](https://github.com/danilaverbena/keeperkit)) ships:
+To balance the friction list:
 
-* a sync + async REST client with retry/error mapping,
-* a `MockKeeperHubClient` (workflow CRUD + executions + logs in-memory),
-* a `WorkflowBuilder` DSL,
-* tool factories for **LangChain (`StructuredTool`)**,
-  **CrewAI (`BaseTool`)**, and **ElizaOS** (plugin descriptor JSON
-  generated from Python),
-* a FastAPI demo server with a dashboard, a ReAct agent, direct tool
-  dispatch, and an ElizaOS dispatch bridge,
-* offline test suite using `respx` + the mock backend.
-
-The above design choices were direct responses to the friction points
-above — wherever the upstream KeeperHub experience could be smoother for
-an AI-agent builder, KeeperKit absorbs that complexity so the next team
-doesn't have to.
+* **The OpenAPI spec is excellent and honest.** Once we found it
+  (`GET /api/openapi`), it described every endpoint correctly — schemas
+  matched real responses, discriminators were typed. This is rarer than
+  it should be.
+* **`helloworld` is a great smoke test.** Free, no inputs, predictable
+  output. Every public API should have one.
+* **Error responses include actionable messages.** Not just "Bad
+  Request" — we got "address must be a valid 0x-prefixed hex string,
+  20 bytes long" which is exactly what an agent needs.
+* **The MCP server is a thoughtful primitive.** We don't lean on it in
+  KeeperKit (we go straight to REST so we can layer our own retry and
+  framework adapters), but the existence of an MCP-shaped surface is the
+  right call.
+* **Onboarding is fast.** Sign up → org → API key → first call took us
+  ~3 minutes. Most "agent-platform" sponsors at this hackathon take 15+.
 
 ---
 
-## Contact
+## 4 · Reproducers
 
-* GitHub repo: <https://github.com/danilaverbena/keeperkit>
-* Live demo: <https://keeperkit.danilaverbena.dev>
-* GitHub author: [@danilaverbena](https://github.com/danilaverbena)
+All reproducers ran against `https://app.keeperhub.com/api` with a
+real `kh_…` org key, May 1 2026.
 
-We're happy to follow up on any of these items, or to land patches against
-KeeperHub's docs/SDKs if that helps.
+```bash
+# 1.1 — marketing-implied endpoints don't exist
+curl -fsS -H "Authorization: Bearer $KEEPERHUB_API_KEY" \
+  https://app.keeperhub.com/api/action-schemas
+# → curl: (22) The requested URL returned error: 404
+
+# 1.2 — paid workflow returns 402 with body `{}` and descriptor in header
+curl -isS -X POST -H "Authorization: Bearer $KEEPERHUB_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"address":"0x000000000000000000000000000000000000dEaD"}' \
+  https://app.keeperhub.com/api/mcp/workflows/aave-v3-health-check/call \
+  | sed -n '1,/^$/p;$p'
+# → HTTP/1.1 402 Payment Required
+# → x-payment-requirements: <base64>
+# → www-authenticate: Payment id="…"
+# → {}
+
+# 1.5 — `helloworld` works first try, no auth needed beyond the key
+curl -fsS -X POST -H "Authorization: Bearer $KEEPERHUB_API_KEY" \
+  -H "content-type: application/json" -d '{}' \
+  https://app.keeperhub.com/api/mcp/workflows/helloworld/call
+# → {"executionId":"…","status":"success",
+#    "output":{"result":{"message":"Hello World!"},"success":true}}
+```
+
+---
+
+## 5 · About KeeperKit
+
+We built KeeperKit to give the LangChain / CrewAI / ElizaOS communities
+a one-import experience for KeeperHub. The full code (Apache-2.0 // MIT)
+and a live demo are at:
+
+* **GitHub**: <https://github.com/danilaverbena/keeperkit>
+* **Live demo**: <http://178.104.45.97:8420> (mock + heuristic mode by
+  default; add a `KEEPERHUB_API_KEY` and any LLM key in `.env` to run
+  against the real API).
+* **Tool catalogue**: 5 static tools (discover / call / openapi / org /
+  integrations) + one auto-generated tool per discoverable workflow.
+* **Tests**: 30 offline tests covering mock + REST + langchain + elizaos.
+
+Thanks to the KeeperHub team for shipping a real, working public API
+during a hackathon — it's not a given, and it made this build possible
+in a single afternoon. Happy to chat about any of the above on Telegram
+or to file PRs against the docs site.

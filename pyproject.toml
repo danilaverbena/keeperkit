@@ -27,14 +27,27 @@ dependencies = [
 [project.optional-dependencies]
 langchain = ["langchain-core>=0.3.0"]
 crewai = ["crewai>=0.70.0"]
+# Individual LLM provider extras — install only the one(s) you need.
+openai = ["langchain-openai>=0.2"]
+anthropic = ["langchain-anthropic>=0.2"]
+google = ["langchain-google-genai>=2.0"]
+groq = ["langchain-groq>=0.2"]
+mistral = ["langchain-mistralai>=0.2"]
+ollama = ["langchain-ollama>=0.2"]
+# DeepSeek / OpenRouter / Together are OpenAI-compatible — they reuse `openai`.
 server = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
     "jinja2>=3.1",
     "python-multipart>=0.0.9",
-    "langchain-openai>=0.2",
     "langchain>=0.3",
     "langgraph>=0.2",
+    # Bundle the most popular LLM providers so the demo just works once you
+    # paste any one of OPENAI / ANTHROPIC / GOOGLE / GROQ keys into .env.
+    "langchain-openai>=0.2",
+    "langchain-anthropic>=0.2",
+    "langchain-google-genai>=2.0",
+    "langchain-groq>=0.2",
 ]
 dev = [
     "pytest>=8.0",
@@ -68,7 +81,7 @@ select = ["E", "F", "W", "I", "B", "UP", "N"]
 #   names so JSON (de)serialisation stays one-to-one with the upstream API.
 # * N806: PEP-8 wants lowercase locals, but pydantic / langchain class names
 #   are PascalCase by convention; aliasing them locally would obscure intent.
-ignore = ["N815", "N806"]
+ignore = ["N815", "N806", "N818"]
 
 [tool.ruff.lint.per-file-ignores]
 # `pytest.importorskip` must run before the imports it guards.

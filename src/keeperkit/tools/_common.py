@@ -1,34 +1,34 @@
 """Framework-agnostic tool definitions consumed by the LangChain / CrewAI shims.
 
 Each tool is described once here as a :class:`ToolSpec` (name, description,
-JSON schema, dispatch function), then the framework adapters turn that into
-LangChain ``BaseTool`` instances or CrewAI ``Tool`` instances. This way new
-frameworks can be added in one file without touching the core.
+JSON schema, dispatch callable). Three "static" tools are always present —
+``list_workflows``, ``call_workflow``, ``get_openapi`` — and one extra tool
+is **auto-generated per discoverable workflow** in the catalogue. That way
+your agent gets a typed, named tool for every KeeperHub workflow without
+any hardcoding: add a new workflow on KeeperHub, refresh the tool list,
+and the agent picks it up.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any, Protocol
-
-from keeperkit.models import Network
 
 
 class _ClientProto(Protocol):
-    """Subset of the client interface our tools rely on (sync)."""
+    """Minimal client surface our tool dispatchers rely on."""
 
-    def list_workflows(self, *, limit: int = ..., offset: int = ...) -> Any: ...
-    def get_workflow(self, workflow_id: str) -> Any: ...
-    def create_workflow(self, workflow: Any) -> Any: ...
-    def execute_workflow(self, workflow_id: str,
-                         inputs: dict[str, Any] | None = ...) -> Any: ...
-    def get_execution_status(self, execution_id: str) -> Any: ...
-    def get_execution_logs(self, execution_id: str) -> Any: ...
-    def execute_action(self, action_type: str, config: dict[str, Any],
-                       *, network: str | None = ...) -> Any: ...
-    def list_action_schemas(self, *, category: str | None = ...) -> Any: ...
-    def ai_generate_workflow(self, description: str,
-                             *, modify_workflow_id: str | None = ...) -> Any: ...
+    def list_workflows(self) -> Any: ...
+    def get_openapi(self) -> Any: ...
+    def call_workflow(self, slug: str, body: dict[str, Any] | None = ...,
+                      *, x_payment: str | None = ...) -> Any: ...
+    def list_org_workflows(self) -> Any: ...
+    def list_integrations(self) -> Any: ...
+
+
+DispatchFn = Callable[..., Any]
 
 
 @dataclass(frozen=True)
@@ -37,12 +37,13 @@ class ToolSpec:
 
     name: str
     description: str
-    parameters: dict[str, Any]  # JSON Schema fragment
-    dispatch_key: str  # which client method we proxy to
+    parameters: dict[str, Any]  # JSON Schema fragment for the args
+    dispatch: DispatchFn         # signature: dispatch(client, **kwargs) -> Any
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _serialize(obj: Any) -> Any:
-    """Turn pydantic / dict / list output into something JSON-friendly."""
+    """Turn arbitrary tool output into something JSON-friendly."""
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
     if isinstance(obj, list):
@@ -54,221 +55,258 @@ def _serialize(obj: Any) -> Any:
     return str(obj)
 
 
-def default_dispatch(client: _ClientProto, spec: ToolSpec,
-                     **kwargs: Any) -> dict[str, Any]:
-    """Generic dispatcher used by all framework adapters."""
-    method = getattr(client, spec.dispatch_key)
-    result = method(**kwargs)
+def _slug_to_ident(slug: str) -> str:
+    """Convert a workflow slug into a Python-safe identifier suffix."""
+    ident = re.sub(r"[^A-Za-z0-9]+", "_", slug).strip("_").lower()
+    return ident or "workflow"
+
+
+# ---------------------------------------------------------------------------
+# Generic dispatch helper used by adapters (catches errors, returns dict).
+# ---------------------------------------------------------------------------
+
+
+def safe_dispatch(spec: ToolSpec, client: _ClientProto, **kwargs: Any) -> dict[str, Any]:
+    """Invoke ``spec.dispatch`` and wrap success / failure into a dict.
+
+    All framework adapters route through this so the LLM sees a uniform
+    ``{ok, data}`` / ``{ok: false, error, ...}`` shape.
+    """
+    from keeperkit.exceptions import KeeperHubAPIError, KeeperHubPaymentRequired
+
+    try:
+        result = spec.dispatch(client, **kwargs)
+    except KeeperHubPaymentRequired as exc:
+        return {
+            "ok": False,
+            "error": "payment_required",
+            "message": str(exc),
+            "x402": exc.x402,
+            "amount_usdc": exc.amount_usdc,
+            "hint": (
+                "This is a paid KeeperHub workflow. Settle via your x402 client "
+                "(agentcash / openclaw / custom signer) and replay the call with "
+                "an `X-Payment` header."
+            ),
+        }
+    except KeeperHubAPIError as exc:
+        return {
+            "ok": False,
+            "error": type(exc).__name__,
+            "status": exc.status_code,
+            "message": str(exc),
+            "payload": _serialize(exc.payload),
+        }
+    except Exception as exc:  # noqa: BLE001 - surface unexpected failures
+        return {"ok": False, "error": type(exc).__name__, "message": str(exc)}
+
     return {"ok": True, "data": _serialize(result)}
 
 
 # ---------------------------------------------------------------------------
-# Tool catalogue. Keep these descriptions LLM-readable: the agent reads them
-# verbatim to decide when to call.
+# Static tools (always present) — discovery + universal call entry point.
 # ---------------------------------------------------------------------------
 
-_NETWORK_DESC = (
-    "EVM chain ID as a string. Common values: "
-    + ", ".join(f"'{n.value}' ({n.name.lower()})" for n in Network)
-    + "."
-)
 
-KEEPERHUB_TOOL_SPECS: tuple[ToolSpec, ...] = (
+def _dispatch_list_workflows(client: _ClientProto) -> Any:
+    return client.list_workflows()
+
+
+def _dispatch_get_openapi(client: _ClientProto) -> Any:
+    return client.get_openapi()
+
+
+def _dispatch_call_workflow(
+    client: _ClientProto,
+    *,
+    slug: str,
+    body: dict[str, Any] | None = None,
+    x_payment: str | None = None,
+) -> Any:
+    return client.call_workflow(slug, body or {}, x_payment=x_payment)
+
+
+def _dispatch_list_org_workflows(client: _ClientProto) -> Any:
+    return client.list_org_workflows()
+
+
+def _dispatch_list_integrations(client: _ClientProto) -> Any:
+    return client.list_integrations()
+
+
+def _make_call_workflow_for_slug(slug: str) -> DispatchFn:
+    """Return a dispatch function that calls a *fixed* workflow slug.
+
+    Each generated tool needs its own closure so the LLM doesn't have to
+    pass the slug back as an argument.
+    """
+
+    def _dispatch(client: _ClientProto, **body: Any) -> Any:
+        x_payment = body.pop("_x_payment", None) if "_x_payment" in body else None
+        return client.call_workflow(slug, body, x_payment=x_payment)
+
+    return _dispatch
+
+
+STATIC_TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="keeperhub_list_workflows",
         description=(
-            "List workflows already configured in your KeeperHub organization. "
-            "Use this to discover existing automations the agent can reuse "
-            "instead of building from scratch."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
-                "offset": {"type": "integer", "default": 0, "minimum": 0},
-            },
-            "additionalProperties": False,
-        },
-        dispatch_key="list_workflows",
-    ),
-    ToolSpec(
-        name="keeperhub_get_workflow",
-        description="Fetch the full configuration (nodes + edges) of a workflow by id.",
-        parameters={
-            "type": "object",
-            "properties": {"workflow_id": {"type": "string"}},
-            "required": ["workflow_id"],
-            "additionalProperties": False,
-        },
-        dispatch_key="get_workflow",
-    ),
-    ToolSpec(
-        name="keeperhub_execute_workflow",
-        description=(
-            "Trigger a stored KeeperHub workflow by id and return the execution "
-            "envelope. KeeperHub handles retries, gas optimization, simulation, "
-            "and private MEV-aware routing."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "workflow_id": {"type": "string"},
-                "inputs": {
-                    "type": "object",
-                    "description": "Optional input payload passed to the workflow.",
-                },
-            },
-            "required": ["workflow_id"],
-            "additionalProperties": False,
-        },
-        dispatch_key="execute_workflow",
-    ),
-    ToolSpec(
-        name="keeperhub_get_execution_status",
-        description=(
-            "Return the current status (pending/running/success/error/cancelled) "
-            "of an execution by id, including per-node progress."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {"execution_id": {"type": "string"}},
-            "required": ["execution_id"],
-            "additionalProperties": False,
-        },
-        dispatch_key="get_execution_status",
-    ),
-    ToolSpec(
-        name="keeperhub_get_execution_logs",
-        description=(
-            "Return per-node execution logs (input, output, duration, tx hashes) "
-            "for an execution. Use this to give the user an audit trail."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {"execution_id": {"type": "string"}},
-            "required": ["execution_id"],
-            "additionalProperties": False,
-        },
-        dispatch_key="get_execution_logs",
-    ),
-    ToolSpec(
-        name="keeperhub_check_balance",
-        description=(
-            "Read the native token balance of an address on a given EVM chain. "
-            "No wallet integration is required."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "network": {"type": "string", "description": _NETWORK_DESC},
-                "address": {"type": "string", "description": "0x-prefixed address."},
-            },
-            "required": ["network", "address"],
-            "additionalProperties": False,
-        },
-        dispatch_key="check_balance",
-    ),
-    ToolSpec(
-        name="keeperhub_transfer_funds",
-        description=(
-            "Send native token (ETH/MATIC/etc.) reliably. KeeperHub adds retry "
-            "logic, gas escalation, simulation-before-submit, and MEV-aware "
-            "private routing. Requires a wallet integration ID."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "network": {"type": "string", "description": _NETWORK_DESC},
-                "to_address": {"type": "string", "description": "0x recipient address."},
-                "amount": {
-                    "type": "string",
-                    "description": "Amount in ETH-units as a string (e.g. '0.1').",
-                },
-                "wallet_id": {
-                    "type": "string",
-                    "description": "KeeperHub wallet integration id "
-                                   "(see `keeperhub_get_wallet_integration`).",
-                },
-            },
-            "required": ["network", "to_address", "amount", "wallet_id"],
-            "additionalProperties": False,
-        },
-        dispatch_key="transfer_funds",
-    ),
-    ToolSpec(
-        name="keeperhub_write_contract",
-        description=(
-            "Call a state-changing contract function via KeeperHub's reliable "
-            "execution path."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "network": {"type": "string", "description": _NETWORK_DESC},
-                "contract_address": {"type": "string"},
-                "function_name": {"type": "string"},
-                "wallet_id": {"type": "string"},
-                "args": {"type": "array", "items": {}},
-                "value": {"type": "string", "description": "Optional native value to send."},
-            },
-            "required": ["network", "contract_address", "function_name", "wallet_id"],
-            "additionalProperties": False,
-        },
-        dispatch_key="write_contract",
-    ),
-    ToolSpec(
-        name="keeperhub_list_action_schemas",
-        description=(
-            "List the action types available on KeeperHub. Filter by category: "
-            "web3, discord, sendgrid, webhook, system."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "enum": ["web3", "discord", "sendgrid", "webhook", "system"],
-                },
-            },
-            "additionalProperties": False,
-        },
-        dispatch_key="list_action_schemas",
-    ),
-    ToolSpec(
-        name="keeperhub_ai_generate_workflow",
-        description=(
-            "Ask KeeperHub's built-in workflow generator to produce a workflow "
-            "from a natural-language description. Useful for skipping manual "
-            "node-by-node construction."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "description": {"type": "string"},
-                "modify_workflow_id": {
-                    "type": "string",
-                    "description": "Optional id of an existing workflow to modify.",
-                },
-            },
-            "required": ["description"],
-            "additionalProperties": False,
-        },
-        dispatch_key="ai_generate_workflow",
-    ),
-    ToolSpec(
-        name="keeperhub_get_wallet_integration",
-        description=(
-            "Return the active wallet integration metadata, including the "
-            "wallet_id needed by transfer/write actions."
+            "Discover the public KeeperHub workflow catalogue. Returns each "
+            "workflow's slug, input JSON Schema, price (USDC), workflow type "
+            "(read|write), category, and target chain. Use this whenever you "
+            "need to choose which KeeperHub action to take next."
         ),
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        dispatch_key="get_wallet_integration",
+        dispatch=_dispatch_list_workflows,
+        metadata={"static": True},
+    ),
+    ToolSpec(
+        name="keeperhub_call_workflow",
+        description=(
+            "Invoke any KeeperHub workflow by slug. The body must satisfy the "
+            "workflow's inputSchema (use keeperhub_list_workflows to look it "
+            "up). Returns {executionId, status, output}. Paid workflows return "
+            "an x402 payment-required descriptor instead of executing — settle "
+            "with your x402 client and pass the X-Payment token via x_payment."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "slug": {
+                    "type": "string",
+                    "description": "Workflow slug, e.g. 'helloworld' or 'aave-v3-health-check'.",
+                },
+                "body": {
+                    "type": "object",
+                    "description": "Workflow input matching its inputSchema.",
+                    "additionalProperties": True,
+                },
+                "x_payment": {
+                    "type": "string",
+                    "description": "Optional x402 payment token (X-Payment header).",
+                },
+            },
+            "required": ["slug"],
+            "additionalProperties": False,
+        },
+        dispatch=_dispatch_call_workflow,
+        metadata={"static": True},
+    ),
+    ToolSpec(
+        name="keeperhub_get_openapi",
+        description=(
+            "Fetch the KeeperHub OpenAPI document. Useful when the agent needs "
+            "the per-workflow JSON Schema (request/response) or the worked "
+            "examples in info.x-guidance."
+        ),
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        dispatch=_dispatch_get_openapi,
+        metadata={"static": True},
+    ),
+    ToolSpec(
+        name="keeperhub_list_org_workflows",
+        description=(
+            "List the workflows owned by *your* KeeperHub organization (the "
+            "one tied to your KEEPERHUB_API_KEY). Use this when you want to "
+            "operate only on workflows you yourself authored, not the public "
+            "catalogue."
+        ),
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        dispatch=_dispatch_list_org_workflows,
+        metadata={"static": True},
+    ),
+    ToolSpec(
+        name="keeperhub_list_integrations",
+        description=(
+            "List wallet / connector integrations configured on your "
+            "KeeperHub org. Returns chain id, integration id, and connector "
+            "metadata. Required input for some write workflows."
+        ),
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        dispatch=_dispatch_list_integrations,
+        metadata={"static": True},
     ),
 )
 
 
-def find_spec(name: str) -> ToolSpec:
-    for spec in KEEPERHUB_TOOL_SPECS:
+# ---------------------------------------------------------------------------
+# Per-workflow tool generation.
+# ---------------------------------------------------------------------------
+
+
+def build_workflow_tools(client: _ClientProto) -> list[ToolSpec]:
+    """Generate one :class:`ToolSpec` per discoverable workflow.
+
+    Each tool's name is ``keeperhub_<slug-as-ident>``, its parameters match
+    the workflow's ``inputSchema``, and its description includes the workflow
+    description, price, type, and chain so the LLM can pick the right one.
+    """
+    catalogue = client.list_workflows()
+    items = catalogue.get("items") if isinstance(catalogue, dict) else catalogue
+    items = items or []
+
+    specs: list[ToolSpec] = []
+    seen: set[str] = set()
+    for wf in items:
+        slug = wf.get("listedSlug")
+        if not slug:
+            continue
+        ident = _slug_to_ident(slug)
+        name = f"keeperhub_{ident}"
+        # Avoid duplicate names if multiple workflows collide on slug shape.
+        if name in seen:
+            continue
+        seen.add(name)
+
+        price = wf.get("priceUsdcPerCall")
+        wf_type = wf.get("workflowType") or "read"
+        chain = wf.get("chain")
+
+        descr_parts = [wf.get("description", "").strip() or wf.get("name", slug)]
+        descr_parts.append(f"[type={wf_type}, slug='{slug}'"
+                           + (f", chain={chain}" if chain else "")
+                           + (f", price={price} USDC" if price else ", free")
+                           + "]")
+        if price:
+            descr_parts.append(
+                "Returns x402 payment_required if no X-Payment token is provided."
+            )
+        description = " ".join(descr_parts)
+
+        schema = wf.get("inputSchema") or {"type": "object", "properties": {}}
+        # JSON Schema in some catalogues lacks "type": "object" at the top level.
+        if "type" not in schema:
+            schema = {"type": "object", **schema}
+
+        specs.append(
+            ToolSpec(
+                name=name,
+                description=description,
+                parameters=schema,
+                dispatch=_make_call_workflow_for_slug(slug),
+                metadata={
+                    "static": False,
+                    "slug": slug,
+                    "price_usdc_per_call": price,
+                    "workflow_type": wf_type,
+                    "chain": chain,
+                    "category": wf.get("category"),
+                },
+            )
+        )
+    return specs
+
+
+def build_all_tool_specs(client: _ClientProto) -> list[ToolSpec]:
+    """Static tools + one tool per discoverable workflow."""
+    return [*STATIC_TOOL_SPECS, *build_workflow_tools(client)]
+
+
+def find_spec(name: str, specs: list[ToolSpec] | None = None) -> ToolSpec:
+    """Look up a spec by name. Raises :class:`KeyError` if absent."""
+    haystack = specs if specs is not None else list(STATIC_TOOL_SPECS)
+    for spec in haystack:
         if spec.name == name:
             return spec
-    raise KeyError(f"Unknown KeeperHub tool: {name}")
+    raise KeyError(f"unknown tool: {name!r}")
