@@ -40,6 +40,26 @@ def test_build_all_combines_static_and_workflow():
     assert len(all_specs) == len(STATIC_TOOL_SPECS) + len(build_workflow_tools(client))
 
 
+def test_workflow_tools_handle_null_description_and_name():
+    """Real KeeperHub catalogue can return entries with description=null;
+    the spec builder must fall back to name/slug instead of crashing."""
+    client = MockKeeperHubClient(catalogue=[
+        {
+            "id": "wf_null_desc",
+            "name": None,
+            "description": None,
+            "listedSlug": "weird-workflow",
+            "workflowType": "read",
+            "priceUsdcPerCall": None,
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+    ])
+    specs = build_workflow_tools(client)
+    assert len(specs) == 1
+    assert specs[0].name == "keeperhub_weird_workflow"
+    assert "weird-workflow" in specs[0].description
+
+
 def test_safe_dispatch_handles_payment_required():
     client = MockKeeperHubClient()
     specs = build_workflow_tools(client)
