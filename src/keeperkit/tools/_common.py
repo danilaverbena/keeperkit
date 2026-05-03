@@ -263,7 +263,8 @@ def build_workflow_tools(client: _ClientProto) -> list[ToolSpec]:
         wf_type = wf.get("workflowType") or "read"
         chain = wf.get("chain")
 
-        descr_parts = [wf.get("description", "").strip() or wf.get("name", slug)]
+        raw_descr = wf.get("description") or wf.get("name") or slug
+        descr_parts = [str(raw_descr).strip() or slug]
         descr_parts.append(f"[type={wf_type}, slug='{slug}'"
                            + (f", chain={chain}" if chain else "")
                            + (f", price={price} USDC" if price else ", free")
